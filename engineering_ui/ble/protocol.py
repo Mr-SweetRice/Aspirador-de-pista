@@ -10,6 +10,7 @@ MAP_NAME_MAX_LEN = 15
 MAP_MAX_POINTS = 2048
 MAP_CHUNK_MAX_POINTS = 12
 CONTROL_MAX_PID_GAIN = 1000.0
+CONTROL_MAX_CORRECTION_PERCENT = 100.0
 RACE_PLAN_MAX_SEGMENTS = 64
 RACE_PLAN_CHUNK_MAX_SEGMENTS = 10
 
@@ -75,6 +76,7 @@ class SendId(IntEnum):
     CONTROL_START_AUTO_TRACK = 0x4B
     CONTROL_SET_AUTO_TRACK_CONFIG = 0x4C
     CONTROL_SET_RACE_PLAN = 0x4D
+    CONTROL_SET_LINE_CONTROLLER = 0x4E
     IMU_CALIBRATE_MAG = 0x30
     IMU_CALIBRATE_ALL = 0x31
     IMU_CALIBRATE_ACCEL_GYRO = 0x32
@@ -140,12 +142,15 @@ MAP_CHUNK_HEADER = struct.Struct("<BHHB")
 MAP_RECORD_CHUNK_HEADER = struct.Struct("<HHBBHf")
 CONTROL_START_FRAME = struct.Struct("<Bb")
 CONTROL_PID_FRAME = struct.Struct("<fffB")
+CONTROL_LINE_CONTROLLER_FRAME = struct.Struct("<ffffff")
 CONTROL_SAVE_PID_FRAME = struct.Struct("<fffBB")
+CONTROL_SAVE_LINE_CONTROLLER_FRAME = struct.Struct("<fffBBfff")
 CONTROL_SPEED_PROFILE_POINT_FRAME = struct.Struct("<BfffB")
 CONTROL_AUTO_TRACK_CONFIG_FRAME = struct.Struct("<BBfB")
 CONTROL_RACE_PLAN_CHUNK_HEADER = struct.Struct("<BBBB")
 CONTROL_RACE_PLAN_SEGMENT_FRAME = struct.Struct("<HHBBBBfff")
-CONTROL_TELEMETRY_FRAME = struct.Struct("<BBHHbffffffffBfffffBBBBffBfffBBHHBBBBf")
+CONTROL_TELEMETRY_PRE_LINE_CONTROLLER_FRAME = struct.Struct("<BBHHbffffffffBfffffBBBBffBfffBBHHBBBBf")
+CONTROL_TELEMETRY_FRAME = struct.Struct("<BBHHbffffffffBfffffBBBBffBfffBBHHBBBBf" + ("f" * 12))
 CONTROL_TELEMETRY_PRE_TASKS_FRAME = struct.Struct("<BBHHbffffffffBfBBBBffBfffBBHHBBBBf")
 CONTROL_TELEMETRY_PRE_RACE_AVERAGE_FRAME = struct.Struct("<BBHHbffffffffBfBBBBffBfffBBHHBBBB")
 CONTROL_TELEMETRY_PRE_ACTIVE_SPEED_FRAME = struct.Struct("<BBHHbffffffffBfBBBBffBfffBBHHBBB")
@@ -691,12 +696,37 @@ def pack_control_pid(kp: float, ki: float, kd: float, motor_limit_percent: int) 
     )
 
 
+def pack_control_line_controller(
+    kp: float,
+    kn: float,
+    kd: float,
+    max_correction_percent: float,
+    base_speed_percent: float,
+    derivative_filter_alpha: float,
+) -> bytes:
+    return pack_packet(
+        CommandClass.SEND,
+        SendId.CONTROL_SET_LINE_CONTROLLER,
+        CONTROL_LINE_CONTROLLER_FRAME.pack(
+            max(0.0, min(CONTROL_MAX_PID_GAIN, float(kp))),
+            max(0.0, min(CONTROL_MAX_PID_GAIN, float(kn))),
+            max(0.0, min(CONTROL_MAX_PID_GAIN, float(kd))),
+            max(0.0, min(CONTROL_MAX_CORRECTION_PERCENT, float(max_correction_percent))),
+            max(0.0, min(100.0, abs(float(base_speed_percent)))),
+            max(0.0, min(1.0, float(derivative_filter_alpha))),
+        ),
+    )
+
+
 def pack_control_save_pid(
     kp: float,
     ki: float,
     kd: float,
     motor_limit_percent: int,
     aux_percent: int | None = None,
+    line_max_correction_percent: float | None = None,
+    line_base_speed_percent: float | None = None,
+    line_derivative_filter_alpha: float | None = None,
 ) -> bytes:
     limit = max(0, min(100, int(motor_limit_percent)))
     safe_kp = max(0.0, min(CONTROL_MAX_PID_GAIN, float(kp)))
@@ -706,6 +736,21 @@ def pack_control_save_pid(
     if aux_percent is not None:
         aux = max(0, min(100, int(aux_percent)))
         payload = CONTROL_SAVE_PID_FRAME.pack(safe_kp, safe_ki, safe_kd, limit, aux)
+        if (
+            line_max_correction_percent is not None
+            and line_base_speed_percent is not None
+            and line_derivative_filter_alpha is not None
+        ):
+            payload = CONTROL_SAVE_LINE_CONTROLLER_FRAME.pack(
+                safe_kp,
+                safe_ki,
+                safe_kd,
+                limit,
+                aux,
+                max(0.0, min(CONTROL_MAX_CORRECTION_PERCENT, float(line_max_correction_percent))),
+                max(0.0, min(100.0, abs(float(line_base_speed_percent)))),
+                max(0.0, min(1.0, float(line_derivative_filter_alpha))),
+            )
     return pack_packet(
         CommandClass.SEND,
         SendId.CONTROL_SAVE_PID,
@@ -912,6 +957,18 @@ def unpack_control_telemetry(payload: bytes) -> dict:
     track_odometry_loop_hz = 0.0
     line_sensor_loop_hz = 0.0
     imu_loop_hz = 0.0
+    line_error_raw = 0.0
+    line_error_normalized = 0.0
+    line_proportional_term = 0.0
+    line_nonlinear_term = 0.0
+    line_derivative_raw = 0.0
+    line_derivative_filtered = 0.0
+    line_correction = 0.0
+    line_left_command = 0.0
+    line_right_command = 0.0
+    line_dt_s = 0.0
+    line_max_correction = 0.0
+    line_derivative_filter_alpha = 0.0
     if len(payload) == CONTROL_TELEMETRY_FRAME.size:
         (
             running,
@@ -952,7 +1009,62 @@ def unpack_control_telemetry(payload: bytes) -> dict:
             race_segment_aux,
             active_speed_percent,
             race_plan_average_speed_mps,
+            line_error_raw,
+            line_error_normalized,
+            line_proportional_term,
+            line_nonlinear_term,
+            line_derivative_raw,
+            line_derivative_filtered,
+            line_correction,
+            line_left_command,
+            line_right_command,
+            line_dt_s,
+            line_max_correction,
+            line_derivative_filter_alpha,
         ) = CONTROL_TELEMETRY_FRAME.unpack(payload)
+        control_map_pose_valid = True
+        active_speed_received = True
+    elif len(payload) == CONTROL_TELEMETRY_PRE_LINE_CONTROLLER_FRAME.size:
+        (
+            running,
+            map_slot,
+            target_index,
+            point_count,
+            speed,
+            target_x,
+            target_y,
+            distance,
+            error,
+            steer,
+            kp,
+            ki,
+            kd,
+            motor_limit,
+            loop_hz,
+            race_plan_loop_hz,
+            track_odometry_loop_hz,
+            line_sensor_loop_hz,
+            imu_loop_hz,
+            mode,
+            speed_profile_enabled,
+            aux_percent,
+            active_aux_percent,
+            average_speed_mps,
+            max_speed_mps,
+            battery_compensation_enabled,
+            control_map_x,
+            control_map_y,
+            control_map_heading,
+            race_segment_active,
+            race_segment_type,
+            race_segment_start,
+            race_segment_end,
+            race_segment_speed,
+            race_segment_max_speed,
+            race_segment_aux,
+            active_speed_percent,
+            race_plan_average_speed_mps,
+        ) = CONTROL_TELEMETRY_PRE_LINE_CONTROLLER_FRAME.unpack(payload)
         control_map_pose_valid = True
         active_speed_received = True
     elif len(payload) == CONTROL_TELEMETRY_PRE_TASKS_FRAME.size:
@@ -1320,6 +1432,18 @@ def unpack_control_telemetry(payload: bytes) -> dict:
         "control_race_segment_speed_percent": race_segment_speed,
         "control_race_segment_max_speed_percent": race_segment_max_speed,
         "control_race_segment_aux_percent": race_segment_aux,
+        "control_line_error_raw": line_error_raw,
+        "control_line_error_normalized": line_error_normalized,
+        "control_line_proportional_term": line_proportional_term,
+        "control_line_nonlinear_term": line_nonlinear_term,
+        "control_line_derivative_raw": line_derivative_raw,
+        "control_line_derivative_filtered": line_derivative_filtered,
+        "control_line_correction": line_correction,
+        "control_line_left_command": line_left_command,
+        "control_line_right_command": line_right_command,
+        "control_line_dt_s": line_dt_s,
+        "control_line_max_correction": line_max_correction,
+        "control_line_derivative_filter_alpha": line_derivative_filter_alpha,
     }
 
 

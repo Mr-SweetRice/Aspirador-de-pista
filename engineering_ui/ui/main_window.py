@@ -32,6 +32,7 @@ from ble.protocol import (
     pack_control_aux_percent,
     pack_control_auto_track_config,
     pack_control_battery_compensation_enabled,
+    pack_control_line_controller,
     pack_control_pid,
     pack_control_race_plan,
     pack_control_save_pid,
@@ -295,6 +296,11 @@ class MainWindow(QMainWindow):
         self.navigation_control.stop_requested.connect(lambda: self._send(pack_control_stop()))
         self.navigation_control.pid_requested.connect(
             lambda kp, ki, kd, limit: self._send(pack_control_pid(kp, ki, kd, limit))
+        )
+        self.navigation_control.line_controller_requested.connect(
+            lambda kp, kn, kd, max_corr, base_speed, d_alpha: self._send(
+                pack_control_line_controller(kp, kn, kd, max_corr, base_speed, d_alpha)
+            )
         )
         self.navigation_control.pid_save_requested.connect(self._save_control_pid)
         self.navigation_control.aux_requested.connect(lambda aux: self._send(pack_control_aux_percent(aux)))
@@ -639,9 +645,30 @@ class MainWindow(QMainWindow):
         self._send(pack_odometry_position(x_m, y_m))
         self.statusBar().showMessage(f"Posicao e angulo resetados: {x_m:.3f}, {y_m:.3f}", 2500)
 
-    def _save_control_pid(self, kp: float, ki: float, kd: float, limit: int, aux: int) -> None:
+    def _save_control_pid(
+        self,
+        kp: float,
+        ki: float,
+        kd: float,
+        limit: int,
+        aux: int,
+        line_max_correction: float,
+        line_base_speed: float,
+        line_derivative_alpha: float,
+    ) -> None:
         self._pending_status_action = "pid_save"
-        self._send(pack_control_save_pid(kp, ki, kd, limit, aux))
+        self._send(
+            pack_control_save_pid(
+                kp,
+                ki,
+                kd,
+                limit,
+                aux,
+                line_max_correction,
+                line_base_speed,
+                line_derivative_alpha,
+            )
+        )
 
     def _on_telemetry_packet(self, data: bytes) -> None:
         try:

@@ -80,6 +80,18 @@ class RobotState:
     control_kp: float = 35.0
     control_ki: float = 0.0
     control_kd: float = 0.0
+    control_line_error_raw: float = 0.0
+    control_line_error_normalized: float = 0.0
+    control_line_proportional_term: float = 0.0
+    control_line_nonlinear_term: float = 0.0
+    control_line_derivative_raw: float = 0.0
+    control_line_derivative_filtered: float = 0.0
+    control_line_correction: float = 0.0
+    control_line_left_command: float = 0.0
+    control_line_right_command: float = 0.0
+    control_line_dt_s: float = 0.0
+    control_line_max_correction: float = 100.0
+    control_line_derivative_filter_alpha: float = 0.15
     control_motor_limit_percent: int = 100
     control_loop_hz: float = 0.0
     race_plan_loop_hz: float = 0.0
@@ -220,6 +232,36 @@ class RobotState:
         self.control_kp = float(sample.get("control_kp", self.control_kp))
         self.control_ki = float(sample.get("control_ki", self.control_ki))
         self.control_kd = float(sample.get("control_kd", self.control_kd))
+        self.control_line_error_raw = float(sample.get("control_line_error_raw", self.control_line_error_raw))
+        self.control_line_error_normalized = float(
+            sample.get("control_line_error_normalized", self.control_line_error_normalized)
+        )
+        self.control_line_proportional_term = float(
+            sample.get("control_line_proportional_term", self.control_line_proportional_term)
+        )
+        self.control_line_nonlinear_term = float(
+            sample.get("control_line_nonlinear_term", self.control_line_nonlinear_term)
+        )
+        self.control_line_derivative_raw = float(
+            sample.get("control_line_derivative_raw", self.control_line_derivative_raw)
+        )
+        self.control_line_derivative_filtered = float(
+            sample.get("control_line_derivative_filtered", self.control_line_derivative_filtered)
+        )
+        self.control_line_correction = float(sample.get("control_line_correction", self.control_line_correction))
+        self.control_line_left_command = float(
+            sample.get("control_line_left_command", self.control_line_left_command)
+        )
+        self.control_line_right_command = float(
+            sample.get("control_line_right_command", self.control_line_right_command)
+        )
+        self.control_line_dt_s = float(sample.get("control_line_dt_s", self.control_line_dt_s))
+        self.control_line_max_correction = float(
+            sample.get("control_line_max_correction", self.control_line_max_correction)
+        )
+        self.control_line_derivative_filter_alpha = float(
+            sample.get("control_line_derivative_filter_alpha", self.control_line_derivative_filter_alpha)
+        )
         self.control_motor_limit_percent = int(sample.get("control_motor_limit_percent", self.control_motor_limit_percent))
         self.control_loop_hz = float(sample.get("control_loop_hz", self.control_loop_hz))
         self.race_plan_loop_hz = float(sample.get("race_plan_loop_hz", self.race_plan_loop_hz))

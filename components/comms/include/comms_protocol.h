@@ -75,6 +75,7 @@ typedef enum {
     COMMS_SEND_CONTROL_START_AUTO_TRACK = 0x4B,
     COMMS_SEND_CONTROL_SET_AUTO_TRACK_CONFIG = 0x4C,
     COMMS_SEND_CONTROL_SET_RACE_PLAN = 0x4D,
+    COMMS_SEND_CONTROL_SET_LINE_CONTROLLER = 0x4E,
     COMMS_SEND_IMU_CALIBRATE_MAG = 0x30,
     COMMS_SEND_IMU_CALIBRATE_ALL = 0x31,
     COMMS_SEND_IMU_CALIBRATE_ACCEL_GYRO = 0x32,
@@ -204,7 +205,28 @@ typedef struct __attribute__((packed)) {
     uint8_t race_segment_aux_percent;
     uint8_t active_speed_percent;
     float race_plan_average_speed_mps;
+    float line_error_raw;
+    float line_error_normalized;
+    float line_proportional_term;
+    float line_nonlinear_term;
+    float line_derivative_raw;
+    float line_derivative_filtered;
+    float line_correction;
+    float line_left_command;
+    float line_right_command;
+    float line_dt_s;
+    float line_max_correction;
+    float line_derivative_filter_alpha;
 } comms_control_telemetry_payload_t;
+
+typedef struct __attribute__((packed)) {
+    float kp;
+    float kn;
+    float kd;
+    float max_correction_percent;
+    float base_speed_percent;
+    float derivative_filter_alpha;
+} comms_control_line_controller_payload_t;
 
 typedef struct __attribute__((packed)) {
     uint8_t straight_speed_percent;

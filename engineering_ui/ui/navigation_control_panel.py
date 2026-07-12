@@ -36,13 +36,13 @@ from ui.robot_marker import GpsRobotMarker
 
 class PidDoubleSpinBox(QDoubleSpinBox):
     def valueFromText(self, text: str) -> float:  # noqa: N802
-        return float(text.strip().replace(",", "."))
+        return float(text.strip().replace("%", "").replace(",", "."))
 
     def textFromValue(self, value: float) -> str:  # noqa: N802
         return f"{value:.{self.decimals()}f}"
 
     def validate(self, text: str, pos: int):  # noqa: N802
-        normalized = text.strip().replace(",", ".")
+        normalized = text.strip().replace("%", "").replace(",", ".")
         if normalized in {"", ".", ","}:
             return (QValidator.State.Intermediate, text, pos)
         try:
@@ -65,7 +65,8 @@ class NavigationControlPanel(QWidget):
     auto_track_start_requested = Signal(int, int, int)
     stop_requested = Signal()
     pid_requested = Signal(float, float, float, int)
-    pid_save_requested = Signal(float, float, float, int, int)
+    line_controller_requested = Signal(float, float, float, float, float, float)
+    pid_save_requested = Signal(float, float, float, int, int, float, float, float)
     aux_requested = Signal(int)
     battery_compensation_requested = Signal(bool)
 
@@ -80,6 +81,7 @@ class NavigationControlPanel(QWidget):
         self._updating_maps = False
         self._pid_dirty = False
         self._pending_pid: tuple[float, float, float, int] | None = None
+        self._pending_line_controller: tuple[float, float, float, float, float, float] | None = None
         self._aux_dirty = False
         self._pending_aux: int | None = None
         self._error_history: list[float] = []
@@ -129,6 +131,21 @@ class NavigationControlPanel(QWidget):
         self.kd_input = PidDoubleSpinBox()
         self._configure_pid_input(self.kd_input, 0.01)
         self.kd_input.setValue(0.0)
+        self.max_correction_input = PidDoubleSpinBox()
+        self.max_correction_input.setRange(0.0, 100.0)
+        self.max_correction_input.setDecimals(1)
+        self.max_correction_input.setSingleStep(1.0)
+        self.max_correction_input.setLocale(QLocale.c())
+        self.max_correction_input.setKeyboardTracking(False)
+        self.max_correction_input.setSuffix(" %")
+        self.max_correction_input.setValue(100.0)
+        self.derivative_alpha_input = PidDoubleSpinBox()
+        self.derivative_alpha_input.setRange(0.0, 1.0)
+        self.derivative_alpha_input.setDecimals(3)
+        self.derivative_alpha_input.setSingleStep(0.01)
+        self.derivative_alpha_input.setLocale(QLocale.c())
+        self.derivative_alpha_input.setKeyboardTracking(False)
+        self.derivative_alpha_input.setValue(0.15)
         self.motor_limit_input = QSpinBox()
         self.motor_limit_input.setRange(0, 100)
         self.motor_limit_input.setValue(100)
@@ -151,8 +168,10 @@ class NavigationControlPanel(QWidget):
         command_layout.addRow("Velocidade", self.speed_input)
         command_layout.addRow("Turbina", self.aux_input)
         command_layout.addRow("Kp", self.kp_input)
-        command_layout.addRow("Ki", self.ki_input)
+        command_layout.addRow("Kn", self.ki_input)
         command_layout.addRow("Kd", self.kd_input)
+        command_layout.addRow("Max correcao", self.max_correction_input)
+        command_layout.addRow("D alpha", self.derivative_alpha_input)
         command_layout.addRow("Limite motor", self.motor_limit_input)
         command_layout.addRow(self.battery_compensation_check)
         command_layout.addRow(self.apply_pid_button)
@@ -169,6 +188,8 @@ class NavigationControlPanel(QWidget):
         self.target_xy_label = QLabel("-")
         self.steer_label = QLabel("-")
         self.pid_label = QLabel("-")
+        self.line_terms_label = QLabel("-")
+        self.line_commands_label = QLabel("-")
         self.limit_label = QLabel("-")
         self.active_speed_label = QLabel("-")
         self.aux_label = QLabel("-")
@@ -180,7 +201,9 @@ class NavigationControlPanel(QWidget):
         status_layout.addRow("distancia", self.distance_label)
         status_layout.addRow("ponto", self.target_xy_label)
         status_layout.addRow("correcao", self.steer_label)
-        status_layout.addRow("pid atual", self.pid_label)
+        status_layout.addRow("ganhos", self.pid_label)
+        status_layout.addRow("linha termos", self.line_terms_label)
+        status_layout.addRow("linha motores", self.line_commands_label)
         status_layout.addRow("limite motor", self.limit_label)
         status_layout.addRow("vel ativa", self.active_speed_label)
         status_layout.addRow("turbina", self.aux_label)
@@ -279,8 +302,18 @@ class NavigationControlPanel(QWidget):
         self.kp_input.valueChanged.connect(self._schedule_pid_live)
         self.ki_input.valueChanged.connect(self._schedule_pid_live)
         self.kd_input.valueChanged.connect(self._schedule_pid_live)
+        self.max_correction_input.valueChanged.connect(self._schedule_pid_live)
+        self.derivative_alpha_input.valueChanged.connect(self._schedule_pid_live)
         self.motor_limit_input.valueChanged.connect(self._schedule_pid_live)
-        for pid_input in (self.kp_input, self.ki_input, self.kd_input, self.motor_limit_input):
+        self.speed_input.valueChanged.connect(self._schedule_pid_live)
+        for pid_input in (
+            self.kp_input,
+            self.ki_input,
+            self.kd_input,
+            self.max_correction_input,
+            self.derivative_alpha_input,
+            self.motor_limit_input,
+        ):
             pid_input.lineEdit().textEdited.connect(self._mark_pid_editing)
             pid_input.editingFinished.connect(self._schedule_pid_live)
         self.aux_input.valueChanged.connect(self._schedule_aux_live)
@@ -344,8 +377,24 @@ class NavigationControlPanel(QWidget):
             state.control_kd,
             state.control_motor_limit_percent,
         )
-        if self._pending_pid and self._pid_matches(self._pending_pid, actual_pid):
+        actual_line_controller = (
+            state.control_kp,
+            state.control_ki,
+            state.control_kd,
+            state.control_line_max_correction,
+            abs(float(state.control_speed_percent)),
+            state.control_line_derivative_filter_alpha,
+        )
+        if (
+            self._pending_pid
+            and self._pid_matches(self._pending_pid, actual_pid)
+            and (
+                self._pending_line_controller is None
+                or self._line_controller_matches(self._pending_line_controller, actual_line_controller)
+            )
+        ):
             self._pending_pid = None
+            self._pending_line_controller = None
             self._pid_dirty = False
             self.apply_pid_button.setText("Salvar PID/limite/turbina")
         if self._pending_aux is not None and int(self._pending_aux) == int(state.control_aux_percent):
@@ -354,6 +403,14 @@ class NavigationControlPanel(QWidget):
 
         if not self._pid_dirty and self._pending_pid is None:
             self._set_pid_inputs(actual_pid)
+            self._set_line_controller_inputs(
+                state.control_line_max_correction,
+                state.control_line_derivative_filter_alpha,
+            )
+            if state.control_speed_percent != 0:
+                self.speed_input.blockSignals(True)
+                self.speed_input.setValue(int(state.control_speed_percent))
+                self.speed_input.blockSignals(False)
         if not self._aux_dirty and self._pending_aux is None:
             self._set_aux_input(state.control_aux_percent)
         if self.battery_compensation_check.isChecked() != state.control_battery_compensation_enabled:
@@ -369,11 +426,19 @@ class NavigationControlPanel(QWidget):
             self.target_label.setText(f"{target_number}/{target_total}")
         else:
             self.target_label.setText(f"{state.control_target_index}/{state.control_point_count}")
-        self.error_label.setText(f"{state.control_angle_error_rad:.3f} rad")
+        self.error_label.setText(f"{state.control_angle_error_rad:.3f}")
         self.distance_label.setText(f"{state.control_distance_m:.3f} m")
         self.target_xy_label.setText(f"{state.control_target_x_m:.3f}, {state.control_target_y_m:.3f}")
         self.steer_label.setText(f"{state.control_steer_percent:.1f} %")
-        self.pid_label.setText(f"{state.control_kp:.3f}, {state.control_ki:.3f}, {state.control_kd:.3f}")
+        self.pid_label.setText(f"Kp {state.control_kp:.3f} | Kn {state.control_ki:.3f} | Kd {state.control_kd:.3f}")
+        self.line_terms_label.setText(
+            f"e {state.control_line_error_normalized:.3f} | P {state.control_line_proportional_term:.1f} "
+            f"| N {state.control_line_nonlinear_term:.1f} | D {state.control_line_derivative_filtered:.1f}"
+        )
+        self.line_commands_label.setText(
+            f"corr {state.control_line_correction:.1f}% | L {state.control_line_left_command:.0f}% "
+            f"| R {state.control_line_right_command:.0f}%"
+        )
         self.limit_label.setText(f"{state.control_motor_limit_percent} % | {mode_label} | {battery_label}")
         self.active_speed_label.setText(f"{state.control_active_speed_percent} % | alvo {state.control_speed_percent} %")
         self.aux_label.setText(f"{state.control_aux_percent} % | ativo {state.control_active_aux_percent} %")
@@ -447,13 +512,28 @@ class NavigationControlPanel(QWidget):
             int(self.motor_limit_input.value()),
         )
 
+    def _current_line_controller(self) -> tuple[float, float, float, float, float, float]:
+        self._interpret_pid_inputs()
+        return (
+            float(self.kp_input.value()),
+            float(self.ki_input.value()),
+            float(self.kd_input.value()),
+            float(self.max_correction_input.value()),
+            abs(float(self.speed_input.value())),
+            float(self.derivative_alpha_input.value()),
+        )
+
     def _emit_pid_live(self) -> None:
         pid = self._current_pid()
+        line_controller = self._current_line_controller()
         self._pending_pid = pid
+        self._pending_line_controller = line_controller
         self._pid_dirty = False
         self.pid_requested.emit(*pid)
+        self.line_controller_requested.emit(*line_controller)
 
     def _emit_pid_save(self) -> None:
+        self._pid_timer.stop()
         self._interpret_pid_inputs()
         pid = (
             float(self.kp_input.value()),
@@ -461,18 +541,22 @@ class NavigationControlPanel(QWidget):
             float(self.kd_input.value()),
             int(self.motor_limit_input.value()),
         )
+        line_controller = self._current_line_controller()
         self._pending_pid = pid
+        self._pending_line_controller = line_controller
         self._pid_dirty = False
         self.apply_pid_button.setText("Salvando...")
         aux = int(self.aux_input.value())
         self._pending_aux = aux
         self._aux_dirty = False
-        self.pid_save_requested.emit(*pid, aux)
+        self.pid_save_requested.emit(*pid, aux, line_controller[3], line_controller[4], line_controller[5])
 
     def finish_pid_save(self, success: bool) -> None:
-        self._pending_pid = None
+        if not success:
+            self._pending_pid = None
+            self._pending_line_controller = None
         self._pending_aux = None
-        self._pid_dirty = False
+        self._pid_dirty = not success
         self._aux_dirty = False
         self.apply_pid_button.setText("PID salvo" if success else "Falha ao salvar PID")
         QTimer.singleShot(1200, lambda: self.apply_pid_button.setText("Salvar PID/limite/turbina"))
@@ -480,16 +564,25 @@ class NavigationControlPanel(QWidget):
     def _schedule_pid_live(self) -> None:
         self._pid_dirty = True
         self._pending_pid = None
+        self._pending_line_controller = None
         self.apply_pid_button.setText("Salvar PID/limite/turbina")
         self._pid_timer.start()
 
     def _mark_pid_editing(self, *_args) -> None:
         self._pid_dirty = True
         self._pending_pid = None
+        self._pending_line_controller = None
         self.apply_pid_button.setText("Salvar PID/limite/turbina")
 
     def _interpret_pid_inputs(self) -> None:
-        for widget in (self.kp_input, self.ki_input, self.kd_input, self.motor_limit_input):
+        for widget in (
+            self.kp_input,
+            self.ki_input,
+            self.kd_input,
+            self.max_correction_input,
+            self.derivative_alpha_input,
+            self.motor_limit_input,
+        ):
             widget.interpretText()
 
     def _set_pid_inputs(self, pid: tuple[float, float, float, int]) -> None:
@@ -498,6 +591,16 @@ class NavigationControlPanel(QWidget):
             (self.ki_input, pid[1]),
             (self.kd_input, pid[2]),
             (self.motor_limit_input, pid[3]),
+        ]
+        for widget, value in widgets:
+            widget.blockSignals(True)
+            widget.setValue(value)
+            widget.blockSignals(False)
+
+    def _set_line_controller_inputs(self, max_correction: float, derivative_alpha: float) -> None:
+        widgets = [
+            (self.max_correction_input, max_correction),
+            (self.derivative_alpha_input, derivative_alpha),
         ]
         for widget, value in widgets:
             widget.blockSignals(True)
@@ -527,6 +630,20 @@ class NavigationControlPanel(QWidget):
             and isclose(a[1], b[1], abs_tol=0.002)
             and isclose(a[2], b[2], abs_tol=0.002)
             and int(a[3]) == int(b[3])
+        )
+
+    @staticmethod
+    def _line_controller_matches(
+        a: tuple[float, float, float, float, float, float],
+        b: tuple[float, float, float, float, float, float],
+    ) -> bool:
+        return (
+            isclose(a[0], b[0], abs_tol=0.002)
+            and isclose(a[1], b[1], abs_tol=0.002)
+            and isclose(a[2], b[2], abs_tol=0.002)
+            and isclose(a[3], b[3], abs_tol=0.05)
+            and int(round(a[4])) == int(round(b[4]))
+            and isclose(a[5], b[5], abs_tol=0.002)
         )
 
     @staticmethod

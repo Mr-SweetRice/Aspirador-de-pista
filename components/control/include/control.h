@@ -68,6 +68,18 @@ typedef struct {
     float kp;
     float ki;
     float kd;
+    float line_error_raw;
+    float line_error_normalized;
+    float line_proportional_term;
+    float line_nonlinear_term;
+    float line_derivative_raw;
+    float line_derivative_filtered;
+    float line_correction;
+    float line_left_command;
+    float line_right_command;
+    float line_dt_s;
+    float line_max_correction;
+    float line_derivative_filter_alpha;
     uint8_t motor_limit_percent;
     float loop_hz;
     float race_plan_loop_hz;
@@ -102,6 +114,12 @@ esp_err_t control_start_line(int8_t speed_percent);
 esp_err_t control_start_auto_track(uint8_t map_slot, int8_t speed_percent);
 esp_err_t control_stop_navigation(void);
 esp_err_t control_set_pid(float kp, float ki, float kd);
+esp_err_t control_set_line_controller(float kp,
+                                      float kn,
+                                      float kd,
+                                      float max_correction_percent,
+                                      float base_speed_percent,
+                                      float derivative_filter_alpha);
 esp_err_t control_save_pid_settings(float kp, float ki, float kd, uint8_t limit_percent, uint8_t aux_percent);
 esp_err_t control_set_speed_profile(const control_speed_profile_point_t *points, size_t count);
 esp_err_t control_set_speed_profile_enabled(bool enabled);

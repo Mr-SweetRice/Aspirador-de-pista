@@ -33,6 +33,9 @@
 #define CONTROL_NVS_KEY_SPEED_PROFILE_ENABLED "ctrl_spd_en"
 #define CONTROL_NVS_KEY_BATTERY_COMPENSATION "ctrl_bat_comp"
 #define CONTROL_NVS_KEY_AUTO_TRACK_CONFIG "ctrl_auto_cfg"
+#define CONTROL_NVS_KEY_LINE_MAX_MILLI "ctrl_lmax"
+#define CONTROL_NVS_KEY_LINE_ALPHA_MILLI "ctrl_lalp"
+#define CONTROL_NVS_KEY_LINE_SPEED "ctrl_lspd"
 #define CONTROL_AUTO_TRACK_CONFIG_LEGACY_LINE_LOSS_OFFSET (sizeof(uint8_t) + sizeof(uint8_t) + sizeof(float))
 #define CONTROL_AUTO_TRACK_CONFIG_LEGACY_SIZE \
     (CONTROL_AUTO_TRACK_CONFIG_LEGACY_LINE_LOSS_OFFSET + sizeof(uint8_t))
@@ -101,6 +104,12 @@ static bool map_encoder_reference_valid;
 static float manual_kp;
 static float manual_ki;
 static float manual_kd;
+static float line_max_correction_percent;
+static float line_derivative_filter_alpha;
+static float line_previous_error_normalized;
+static float line_filtered_derivative;
+static bool line_controller_ready;
+static bool line_was_visible;
 static float error_integral_rad_s;
 static float previous_error_rad;
 static bool have_previous_error;
@@ -126,6 +135,17 @@ typedef struct {
     float progress_m;
     bool complete;
 } control_map_progress_t;
+
+typedef struct {
+    float error_raw;
+    float error_normalized;
+    float proportional;
+    float nonlinear;
+    float derivative_raw;
+    float derivative_filtered;
+    float correction;
+    float dt_s;
+} control_line_output_t;
 
 static int32_t gain_to_milli(float value)
 {
@@ -659,6 +679,20 @@ static void load_settings_from_nvs(void)
     if (nvs_get_u8(handle, CONTROL_NVS_KEY_AUX, &aux_percent) == ESP_OK && aux_percent <= 100) {
         nav_state.aux_percent = aux_percent;
     }
+    if (nvs_get_i32(handle, CONTROL_NVS_KEY_LINE_MAX_MILLI, &stored) == ESP_OK &&
+        stored >= 0 && stored <= gain_to_milli(CONTROL_MAX_STEER_PERCENT)) {
+        line_max_correction_percent = milli_to_gain(stored);
+        nav_state.line_max_correction = line_max_correction_percent;
+    }
+    if (nvs_get_i32(handle, CONTROL_NVS_KEY_LINE_ALPHA_MILLI, &stored) == ESP_OK &&
+        stored >= 0 && stored <= gain_to_milli(1.0f)) {
+        line_derivative_filter_alpha = milli_to_gain(stored);
+        nav_state.line_derivative_filter_alpha = line_derivative_filter_alpha;
+    }
+    uint8_t line_speed = abs_speed_percent(nav_state.speed_percent);
+    if (nvs_get_u8(handle, CONTROL_NVS_KEY_LINE_SPEED, &line_speed) == ESP_OK && line_speed <= 100) {
+        nav_state.speed_percent = (int8_t)line_speed;
+    }
     uint8_t speed_profile_enabled = nav_state.speed_profile_enabled ? 1 : 0;
     if (nvs_get_u8(handle, CONTROL_NVS_KEY_SPEED_PROFILE_ENABLED, &speed_profile_enabled) == ESP_OK) {
         nav_state.speed_profile_enabled = speed_profile_enabled != 0;
@@ -689,7 +723,14 @@ static void load_settings_from_nvs(void)
     nvs_close(handle);
 }
 
-static esp_err_t save_settings_to_nvs(float kp, float ki, float kd, uint8_t limit_percent, uint8_t aux_percent)
+static esp_err_t save_settings_to_nvs(float kp,
+                                      float ki,
+                                      float kd,
+                                      uint8_t limit_percent,
+                                      uint8_t aux_percent,
+                                      float line_max_correction,
+                                      float line_derivative_alpha,
+                                      uint8_t line_base_speed)
 {
     nvs_handle_t handle;
     esp_err_t ret = nvs_open(MEMORY_NVS_NAMESPACE, NVS_READWRITE, &handle);
@@ -709,6 +750,15 @@ static esp_err_t save_settings_to_nvs(float kp, float ki, float kd, uint8_t limi
     }
     if (ret == ESP_OK) {
         ret = nvs_set_u8(handle, CONTROL_NVS_KEY_AUX, aux_percent);
+    }
+    if (ret == ESP_OK) {
+        ret = nvs_set_i32(handle, CONTROL_NVS_KEY_LINE_MAX_MILLI, gain_to_milli(line_max_correction));
+    }
+    if (ret == ESP_OK) {
+        ret = nvs_set_i32(handle, CONTROL_NVS_KEY_LINE_ALPHA_MILLI, gain_to_milli(line_derivative_alpha));
+    }
+    if (ret == ESP_OK) {
+        ret = nvs_set_u8(handle, CONTROL_NVS_KEY_LINE_SPEED, line_base_speed);
     }
     if (ret == ESP_OK) {
         ret = nvs_commit(handle);
@@ -823,6 +873,17 @@ static float clamp_abs(float value, float limit)
     return value;
 }
 
+static float clamp_float(float value, float min_value, float max_value)
+{
+    if (value < min_value) {
+        return min_value;
+    }
+    if (value > max_value) {
+        return max_value;
+    }
+    return value;
+}
+
 static void update_error_integral(float error, float dt_s)
 {
     if (fabsf(error) <= CONTROL_INTEGRAL_RESET_ERROR_RAD) {
@@ -831,6 +892,134 @@ static void update_error_integral(float error, float dt_s)
     }
 
     error_integral_rad_s = clamp_abs(error_integral_rad_s + (error * dt_s), CONTROL_MAX_INTEGRAL_RAD_S);
+}
+
+static float normalize_line_error(float error_raw)
+{
+    const float max_error = CONTROL_LINE_MAX_ERROR_POSITION;
+    if (!isfinite(error_raw) || max_error <= 0.0f) {
+        return 0.0f;
+    }
+
+    // A posicao QTR vai de 0 a 7000, centro 3500; logo o erro bruto maximo e +/-3500.
+    return clamp_float(error_raw / max_error, -1.0f, 1.0f);
+}
+
+static void reset_line_controller(float current_error_raw)
+{
+    // Reinicializa apos start/perda de linha para evitar derivative kick na proxima amostra valida.
+    line_previous_error_normalized = normalize_line_error(current_error_raw);
+    line_filtered_derivative = 0.0f;
+    line_controller_ready = true;
+}
+
+static void clear_line_telemetry_locked(void)
+{
+    nav_state.line_error_raw = 0.0f;
+    nav_state.line_error_normalized = 0.0f;
+    nav_state.line_proportional_term = 0.0f;
+    nav_state.line_nonlinear_term = 0.0f;
+    nav_state.line_derivative_raw = 0.0f;
+    nav_state.line_derivative_filtered = 0.0f;
+    nav_state.line_correction = 0.0f;
+    nav_state.line_left_command = 0.0f;
+    nav_state.line_right_command = 0.0f;
+    nav_state.line_dt_s = 0.0f;
+    nav_state.line_max_correction = line_max_correction_percent;
+    nav_state.line_derivative_filter_alpha = line_derivative_filter_alpha;
+}
+
+static control_line_output_t calculate_line_control(float error_raw,
+                                                    float dt_s,
+                                                    const control_speed_profile_point_t *profile,
+                                                    float max_correction,
+                                                    float derivative_alpha)
+{
+    control_line_output_t output = {0};
+    output.error_raw = isfinite(error_raw) ? error_raw : 0.0f;
+    output.error_normalized = normalize_line_error(output.error_raw);
+
+    if (profile == NULL) {
+        return output;
+    }
+
+    if (!isfinite(dt_s) || dt_s < CONTROL_LINE_DT_MIN_S || dt_s > CONTROL_LINE_DT_MAX_S) {
+        dt_s = 0.0f;
+    }
+    output.dt_s = dt_s;
+
+    derivative_alpha = clamp_float(derivative_alpha, 0.0f, 1.0f);
+    max_correction = clamp_float(max_correction, 0.0f, CONTROL_MAX_STEER_PERCENT);
+
+    float derivative_raw = 0.0f;
+    if (line_controller_ready && dt_s > 0.0f) {
+        derivative_raw = (output.error_normalized - line_previous_error_normalized) / dt_s;
+        if (!isfinite(derivative_raw)) {
+            derivative_raw = 0.0f;
+        }
+    } else {
+        line_controller_ready = true;
+    }
+
+    // Filtro passa-baixas no derivativo reduz ruido do sensor sem atrasar o termo proporcional.
+    line_filtered_derivative =
+        (derivative_alpha * derivative_raw) + ((1.0f - derivative_alpha) * line_filtered_derivative);
+    if (!isfinite(line_filtered_derivative)) {
+        line_filtered_derivative = 0.0f;
+    }
+
+    // Termo nao linear preserva o sinal: e*|e| aumenta agressividade so para erro grande.
+    const float nonlinear_error = output.error_normalized * fabsf(output.error_normalized);
+    output.proportional = profile->kp * output.error_normalized;
+    output.nonlinear = profile->ki * nonlinear_error;
+    output.derivative_raw = derivative_raw;
+    output.derivative_filtered = line_filtered_derivative;
+    output.correction = clamp_abs(output.proportional +
+                                      output.nonlinear +
+                                      (profile->kd * output.derivative_filtered),
+                                  max_correction);
+
+    line_previous_error_normalized = output.error_normalized;
+    return output;
+}
+
+static void saturate_motor_pair_preserve_delta(float *left,
+                                               float *right,
+                                               uint8_t limit_percent,
+                                               bool battery_compensation_enabled)
+{
+    if (left == NULL || right == NULL) {
+        return;
+    }
+
+    const float voltage_scale = battery_voltage_scale(battery_compensation_enabled);
+    float limit = (float)limit_percent * voltage_scale;
+    if (limit > 100.0f) {
+        limit = 100.0f;
+    }
+    if (limit < 0.0f) {
+        limit = 0.0f;
+    }
+
+    *left *= voltage_scale;
+    *right *= voltage_scale;
+
+    // Desloca os dois comandos juntos antes do clamp final para preservar a diferenca solicitada.
+    const float high = fmaxf(*left, *right);
+    const float low = fminf(*left, *right);
+    if (high > limit) {
+        const float shift = high - limit;
+        *left -= shift;
+        *right -= shift;
+    }
+    if (low < -limit) {
+        const float shift = -limit - low;
+        *left += shift;
+        *right += shift;
+    }
+
+    *left = clamp_float(*left, -limit, limit);
+    *right = clamp_float(*right, -limit, limit);
 }
 
 static void reset_speed_stats(void)
@@ -909,10 +1098,13 @@ static float set_navigation_stopped_with_aux(uint8_t active_aux_percent)
     nav_state.max_speed_mps = speed_max_mps;
     nav_state.loop_hz = loop_hz;
     update_active_race_segment_locked(NULL);
+    clear_line_telemetry_locked();
     error_integral_rad_s = 0.0f;
     previous_error_rad = 0.0f;
     have_previous_error = false;
+    line_was_visible = false;
     portEXIT_CRITICAL(&state_mux);
+    reset_line_controller(0.0f);
     return race_plan_average_mps;
 }
 
@@ -1122,6 +1314,8 @@ static void control_task(void *arg)
         float local_manual_kp = 0.0f;
         float local_manual_ki = 0.0f;
         float local_manual_kd = 0.0f;
+        float local_line_max_correction = 0.0f;
+        float local_line_derivative_filter_alpha = 0.0f;
         bool local_race_plan_runtime_enabled = false;
         portENTER_CRITICAL(&state_mux);
         local = nav_state;
@@ -1129,6 +1323,8 @@ static void control_task(void *arg)
         local_manual_kp = manual_kp;
         local_manual_ki = manual_ki;
         local_manual_kd = manual_kd;
+        local_line_max_correction = line_max_correction_percent;
+        local_line_derivative_filter_alpha = line_derivative_filter_alpha;
         local_race_plan_runtime_enabled = race_plan_runtime_enabled;
         portEXIT_CRITICAL(&state_mux);
 
@@ -1176,7 +1372,10 @@ static void control_task(void *arg)
                     nav_state.steer_percent = 0.0f;
                     nav_state.active_speed_percent = 0;
                     nav_state.active_aux_percent = 0;
+                    clear_line_telemetry_locked();
+                    line_was_visible = false;
                     portEXIT_CRITICAL(&state_mux);
+                    reset_line_controller(0.0f);
                     continue;
                 }
             } else {
@@ -1206,13 +1405,6 @@ static void control_task(void *arg)
                     }
                 }
 
-                const float dt_s = (float)dt_us / 1000000.0f;
-                const float error = use_previous_line_error
-                                        ? previous_error_rad
-                                        : CONTROL_LINE_STEER_SIGN *
-                                              (((float)line.position - CONTROL_LINE_CENTER_POSITION) /
-                                               CONTROL_LINE_POSITION_SCALE);
-
                 control_drive_selection_t drive = race_plan_runtime_mode || !auto_track_mode ?
                                                       select_line_drive(&local,
                                                                         local_manual_kp,
@@ -1236,25 +1428,42 @@ static void control_task(void *arg)
                     last_aux_percent = active_aux_percent;
                 }
 
-                update_error_integral(error, dt_s);
-                const float derivative = (!use_previous_line_error && have_previous_error) ?
-                                             (error - previous_error_rad) / dt_s :
-                                             0.0f;
-                previous_error_rad = error;
+                const float dt_s = (float)dt_us / 1000000.0f;
+                const float measured_error_raw = CONTROL_LINE_STEER_SIGN *
+                                                 ((float)line.position - CONTROL_LINE_CENTER_POSITION);
+                const float error_raw = use_previous_line_error ?
+                                            previous_error_rad * CONTROL_LINE_MAX_ERROR_POSITION :
+                                            measured_error_raw;
+                if (use_previous_line_error || !line_was_visible) {
+                    reset_line_controller(error_raw);
+                }
+                line_was_visible = line.line_visible;
+                const control_line_output_t line_output = calculate_line_control(error_raw,
+                                                                                 dt_s,
+                                                                                 &drive.profile,
+                                                                                 local_line_max_correction,
+                                                                                 local_line_derivative_filter_alpha);
+                previous_error_rad = line_output.error_normalized;
                 have_previous_error = true;
-                const float steer = clamp_abs((drive.profile.kp * error) +
-                                                  (drive.profile.ki * error_integral_rad_s) +
-                                                  (drive.profile.kd * derivative),
-                                              CONTROL_MAX_STEER_PERCENT);
-                const int left = clamp_motor_percent((float)drive.drive_speed_percent - steer,
-                                                     drive.motor_limit_percent,
-                                                     local.battery_compensation_enabled);
-                const int right = clamp_motor_percent((float)drive.drive_speed_percent + steer,
-                                                      drive.motor_limit_percent,
-                                                      local.battery_compensation_enabled);
+                float steer = line_output.correction;
+                if (drive.drive_speed_percent == 0) {
+                    steer = 0.0f;
+                }
+                float left_command = (float)drive.drive_speed_percent - steer;
+                float right_command = (float)drive.drive_speed_percent + steer;
+                saturate_motor_pair_preserve_delta(&left_command,
+                                                   &right_command,
+                                                   drive.motor_limit_percent,
+                                                   local.battery_compensation_enabled);
+                const int left = (int)lroundf(left_command);
+                const int right = (int)lroundf(right_command);
 
-                motors_set_percent(MOTORS_MOTOR_LEFT, left);
-                motors_set_percent(MOTORS_MOTOR_RIGHT, right);
+                if (drive.drive_speed_percent == 0) {
+                    motors_brake_drive();
+                } else {
+                    motors_set_percent(MOTORS_MOTOR_LEFT, left);
+                    motors_set_percent(MOTORS_MOTOR_RIGHT, right);
+                }
 
                 portENTER_CRITICAL(&state_mux);
                 if (auto_track_mode && !race_plan_runtime_mode) {
@@ -1270,7 +1479,8 @@ static void control_task(void *arg)
                     }
                 } else if (!auto_track_mode) {
                     float display_position = CONTROL_LINE_CENTER_POSITION +
-                                             ((error / CONTROL_LINE_STEER_SIGN) * CONTROL_LINE_POSITION_SCALE);
+                                             ((line_output.error_normalized / CONTROL_LINE_STEER_SIGN) *
+                                              CONTROL_LINE_MAX_ERROR_POSITION);
                     if (display_position < 0.0f) {
                         display_position = 0.0f;
                     }
@@ -1281,13 +1491,25 @@ static void control_task(void *arg)
                     nav_state.point_count = 7000;
                     nav_state.target_x_m = display_position / 7000.0f;
                     nav_state.target_y_m = 0.0f;
-                    nav_state.distance_m = fabsf(error);
+                    nav_state.distance_m = fabsf(line_output.error_normalized);
                 }
-                nav_state.angle_error_rad = error;
+                nav_state.angle_error_rad = line_output.error_normalized;
                 nav_state.steer_percent = steer;
                 nav_state.kp = drive.profile.kp;
                 nav_state.ki = drive.profile.ki;
                 nav_state.kd = drive.profile.kd;
+                nav_state.line_error_raw = line_output.error_raw;
+                nav_state.line_error_normalized = line_output.error_normalized;
+                nav_state.line_proportional_term = line_output.proportional;
+                nav_state.line_nonlinear_term = line_output.nonlinear;
+                nav_state.line_derivative_raw = line_output.derivative_raw;
+                nav_state.line_derivative_filtered = line_output.derivative_filtered;
+                nav_state.line_correction = steer;
+                nav_state.line_left_command = (float)left;
+                nav_state.line_right_command = (float)right;
+                nav_state.line_dt_s = line_output.dt_s;
+                nav_state.line_max_correction = local_line_max_correction;
+                nav_state.line_derivative_filter_alpha = local_line_derivative_filter_alpha;
                 nav_state.active_speed_percent = drive.selected_speed_percent;
                 if (!race_plan_runtime_mode) {
                     update_active_race_segment_locked(auto_track_mode ? &drive : NULL);
@@ -1298,6 +1520,8 @@ static void control_task(void *arg)
             }
         }
 
+        line_was_visible = false;
+        reset_line_controller(have_previous_error ? previous_error_rad * CONTROL_LINE_MAX_ERROR_POSITION : 0.0f);
         odometry_state_t odometry = {0};
         if (!odometry_get_state(&odometry)) {
             continue;
@@ -1406,9 +1630,15 @@ esp_err_t control_init(void)
     manual_kp = CONTROL_HEADING_KP_PERCENT_PER_RAD;
     manual_ki = CONTROL_HEADING_KI_PERCENT_PER_RAD_S;
     manual_kd = CONTROL_HEADING_KD_PERCENT_S_PER_RAD;
+    line_max_correction_percent = CONTROL_LINE_MAX_CORRECTION_PERCENT;
+    line_derivative_filter_alpha = CONTROL_LINE_DERIVATIVE_FILTER_ALPHA;
+    reset_line_controller(0.0f);
+    line_was_visible = false;
     nav_state.kp = manual_kp;
     nav_state.ki = manual_ki;
     nav_state.kd = manual_kd;
+    nav_state.line_max_correction = line_max_correction_percent;
+    nav_state.line_derivative_filter_alpha = line_derivative_filter_alpha;
     nav_state.motor_limit_percent = CONTROL_DEFAULT_MOTOR_LIMIT_PERCENT;
     nav_state.active_speed_percent = 0;
     nav_state.aux_percent = 0;
@@ -1599,10 +1829,13 @@ esp_err_t control_start_map(uint8_t map_slot, int8_t speed_percent)
     nav_state.loop_hz = loop_hz;
     nav_state.speed_profile_enabled = speed_profile_enabled;
     nav_state.battery_compensation_enabled = battery_compensation_enabled;
+    clear_line_telemetry_locked();
+    line_was_visible = false;
     error_integral_rad_s = 0.0f;
     previous_error_rad = 0.0f;
     have_previous_error = false;
     portEXIT_CRITICAL(&state_mux);
+    reset_line_controller(0.0f);
     reset_map_encoder_reference();
 
     ESP_LOGI(TAG,
@@ -1632,6 +1865,10 @@ esp_err_t control_start_line(int8_t speed_percent)
         return ESP_ERR_INVALID_STATE;
     }
     reset_speed_stats();
+    const float line_error_raw = line.line_visible ?
+                                     CONTROL_LINE_STEER_SIGN *
+                                         ((float)line.position - CONTROL_LINE_CENTER_POSITION) :
+                                     0.0f;
 
     portENTER_CRITICAL(&state_mux);
     const float kp = manual_kp;
@@ -1664,10 +1901,15 @@ esp_err_t control_start_line(int8_t speed_percent)
     nav_state.loop_hz = loop_hz;
     nav_state.speed_profile_enabled = speed_profile_enabled;
     nav_state.battery_compensation_enabled = battery_compensation_enabled;
+    clear_line_telemetry_locked();
+    nav_state.line_error_raw = line_error_raw;
+    nav_state.line_error_normalized = normalize_line_error(line_error_raw);
+    line_was_visible = line.line_visible;
     error_integral_rad_s = 0.0f;
-    previous_error_rad = 0.0f;
+    previous_error_rad = normalize_line_error(line_error_raw);
     have_previous_error = false;
     portEXIT_CRITICAL(&state_mux);
+    reset_line_controller(line_error_raw);
 
     ESP_LOGI(TAG, "Controle linha iniciado speed=%d%% pos=%u", (int)speed_percent, (unsigned int)line.position);
     return ESP_OK;
@@ -1756,10 +1998,13 @@ esp_err_t control_start_auto_track(uint8_t map_slot, int8_t speed_percent)
     nav_state.loop_hz = loop_hz;
     nav_state.speed_profile_enabled = speed_profile_enabled;
     nav_state.battery_compensation_enabled = battery_compensation_enabled;
+    clear_line_telemetry_locked();
+    line_was_visible = false;
     error_integral_rad_s = 0.0f;
     previous_error_rad = 0.0f;
     have_previous_error = false;
     portEXIT_CRITICAL(&state_mux);
+    reset_line_controller(0.0f);
     reset_map_encoder_reference();
 
     ESP_LOGI(TAG,
@@ -1807,8 +2052,67 @@ esp_err_t control_set_pid(float kp, float ki, float kd)
     previous_error_rad = 0.0f;
     have_previous_error = false;
     portEXIT_CRITICAL(&state_mux);
+    reset_line_controller(0.0f);
 
     ESP_LOGI(TAG, "PID controle ajustado kp=%.3f ki=%.3f kd=%.3f", kp, ki, kd);
+    return ESP_OK;
+}
+
+esp_err_t control_set_line_controller(float kp,
+                                      float kn,
+                                      float kd,
+                                      float max_correction_percent,
+                                      float base_speed_percent,
+                                      float derivative_filter_alpha)
+{
+    if (!initialized) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!isfinite(kp) || !isfinite(kn) || !isfinite(kd) ||
+        !isfinite(max_correction_percent) || !isfinite(base_speed_percent) ||
+        !isfinite(derivative_filter_alpha) ||
+        kp < 0.0f || kn < 0.0f || kd < 0.0f ||
+        kp > CONTROL_MAX_PID_GAIN || kn > CONTROL_MAX_PID_GAIN || kd > CONTROL_MAX_PID_GAIN ||
+        max_correction_percent < 0.0f || max_correction_percent > CONTROL_MAX_STEER_PERCENT ||
+        base_speed_percent < 0.0f || base_speed_percent > 100.0f ||
+        derivative_filter_alpha < 0.0f || derivative_filter_alpha > 1.0f) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    const int8_t base_speed = (int8_t)lroundf(base_speed_percent);
+    float current_error_raw = 0.0f;
+
+    portENTER_CRITICAL(&state_mux);
+    manual_kp = kp;
+    manual_ki = kn;
+    manual_kd = kd;
+    line_max_correction_percent = max_correction_percent;
+    line_derivative_filter_alpha = derivative_filter_alpha;
+    current_error_raw = nav_state.line_error_raw;
+    const int8_t direction = nav_state.speed_percent < 0 ? -1 : 1;
+    nav_state.speed_percent = (int8_t)(direction * base_speed);
+    nav_state.kp = kp;
+    nav_state.ki = kn;
+    nav_state.kd = kd;
+    nav_state.line_max_correction = max_correction_percent;
+    nav_state.line_derivative_filter_alpha = derivative_filter_alpha;
+    if (!nav_state.running) {
+        nav_state.active_speed_percent = 0;
+    }
+    error_integral_rad_s = 0.0f;
+    previous_error_rad = normalize_line_error(current_error_raw);
+    have_previous_error = false;
+    portEXIT_CRITICAL(&state_mux);
+
+    reset_line_controller(current_error_raw);
+    ESP_LOGI(TAG,
+             "Controle linha ajustado kp=%.3f kn=%.3f kd=%.3f max_corr=%.1f base=%.1f d_alpha=%.3f",
+             kp,
+             kn,
+             kd,
+             max_correction_percent,
+             base_speed_percent,
+             derivative_filter_alpha);
     return ESP_OK;
 }
 
@@ -1826,17 +2130,36 @@ esp_err_t control_save_pid_settings(float kp, float ki, float kd, uint8_t limit_
     if (ret != ESP_OK) {
         return ret;
     }
-    ret = save_settings_to_nvs(kp, ki, kd, limit_percent, aux_percent);
+    float saved_line_max_correction = CONTROL_LINE_MAX_CORRECTION_PERCENT;
+    float saved_line_derivative_alpha = CONTROL_LINE_DERIVATIVE_FILTER_ALPHA;
+    uint8_t saved_line_base_speed = 0;
+    portENTER_CRITICAL(&state_mux);
+    saved_line_max_correction = line_max_correction_percent;
+    saved_line_derivative_alpha = line_derivative_filter_alpha;
+    saved_line_base_speed = abs_speed_percent(nav_state.speed_percent);
+    portEXIT_CRITICAL(&state_mux);
+
+    ret = save_settings_to_nvs(kp,
+                               ki,
+                               kd,
+                               limit_percent,
+                               aux_percent,
+                               saved_line_max_correction,
+                               saved_line_derivative_alpha,
+                               saved_line_base_speed);
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "Falha ao salvar PID/limite: %s", esp_err_to_name(ret));
     } else {
         ESP_LOGI(TAG,
-                 "PID/limite/turbina salvos kp=%.3f ki=%.3f kd=%.3f limit=%u aux=%u",
+                 "PID/limite/turbina salvos kp=%.3f kn=%.3f kd=%.3f limit=%u aux=%u line_max=%.1f base=%u d_alpha=%.3f",
                  kp,
                  ki,
                  kd,
                  (unsigned int)limit_percent,
-                 (unsigned int)aux_percent);
+                 (unsigned int)aux_percent,
+                 saved_line_max_correction,
+                 (unsigned int)saved_line_base_speed,
+                 saved_line_derivative_alpha);
     }
     return ret;
 }
@@ -1869,6 +2192,7 @@ esp_err_t control_set_speed_profile_enabled(bool enabled)
     previous_error_rad = 0.0f;
     have_previous_error = false;
     portEXIT_CRITICAL(&state_mux);
+    reset_line_controller(0.0f);
 
     esp_err_t ret = save_speed_profile_enabled_to_nvs(false);
     if (ret != ESP_OK) {

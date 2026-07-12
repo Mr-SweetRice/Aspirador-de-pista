@@ -595,6 +595,18 @@ static bool build_control_telemetry_packet(uint8_t *buffer, uint16_t buffer_len,
     payload.race_segment_aux_percent = control.race_segment_aux_percent;
     payload.active_speed_percent = control.active_speed_percent;
     payload.race_plan_average_speed_mps = control.race_plan_average_speed_mps;
+    payload.line_error_raw = control.line_error_raw;
+    payload.line_error_normalized = control.line_error_normalized;
+    payload.line_proportional_term = control.line_proportional_term;
+    payload.line_nonlinear_term = control.line_nonlinear_term;
+    payload.line_derivative_raw = control.line_derivative_raw;
+    payload.line_derivative_filtered = control.line_derivative_filtered;
+    payload.line_correction = control.line_correction;
+    payload.line_left_command = control.line_left_command;
+    payload.line_right_command = control.line_right_command;
+    payload.line_dt_s = control.line_dt_s;
+    payload.line_max_correction = control.line_max_correction;
+    payload.line_derivative_filter_alpha = control.line_derivative_filter_alpha;
 
     buffer[0] = COMMS_PROTOCOL_VERSION;
     buffer[1] = COMMS_CMD_CLASS_TELE;
@@ -1638,6 +1650,30 @@ static void handle_send_command(const comms_packet_view_t *packet)
         notify_status(ret == ESP_OK ? COMMS_ERROR_OK : COMMS_ERROR_INTERNAL);
         break;
     }
+    case COMMS_SEND_CONTROL_SET_LINE_CONTROLLER: {
+        comms_control_line_controller_payload_t payload = {0};
+        esp_err_t ret = ESP_ERR_INVALID_SIZE;
+        if (packet->payload_len == sizeof(payload)) {
+            memcpy(&payload, packet->payload, sizeof(payload));
+            ret = control_set_line_controller(payload.kp,
+                                              payload.kn,
+                                              payload.kd,
+                                              payload.max_correction_percent,
+                                              payload.base_speed_percent,
+                                              payload.derivative_filter_alpha);
+        }
+        ESP_LOGI(TAG,
+                 "SEND controle linha kp=%.3f kn=%.3f kd=%.3f max_corr=%.1f base=%.1f d_alpha=%.3f ret=%s",
+                 payload.kp,
+                 payload.kn,
+                 payload.kd,
+                 payload.max_correction_percent,
+                 payload.base_speed_percent,
+                 payload.derivative_filter_alpha,
+                 esp_err_to_name(ret));
+        notify_status(ret == ESP_OK ? COMMS_ERROR_OK : COMMS_ERROR_INTERNAL);
+        break;
+    }
     case COMMS_SEND_CONTROL_STOP: {
         esp_err_t ret = control_stop_navigation();
         ESP_LOGI(TAG, "SEND control stop ret=%s", esp_err_to_name(ret));
@@ -1680,10 +1716,18 @@ static void handle_send_command(const comms_packet_view_t *packet)
         float kp = 0.0f;
         float ki = 0.0f;
         float kd = 0.0f;
+        float line_max_correction = 0.0f;
+        float line_base_speed = 0.0f;
+        float line_derivative_alpha = 0.0f;
         uint8_t motor_limit_percent = 100;
         uint8_t aux_percent = 0;
         esp_err_t ret = ESP_ERR_INVALID_SIZE;
         if (packet->payload_len >= sizeof(kp) + sizeof(ki) + sizeof(kd) + sizeof(motor_limit_percent)) {
+            const uint16_t base_len = sizeof(kp) + sizeof(ki) + sizeof(kd) + sizeof(motor_limit_percent);
+            const uint16_t aux_len = base_len + sizeof(aux_percent);
+            const uint16_t line_len = aux_len + sizeof(line_max_correction) +
+                                      sizeof(line_base_speed) +
+                                      sizeof(line_derivative_alpha);
             memcpy(&kp, packet->payload, sizeof(kp));
             memcpy(&ki, &packet->payload[sizeof(kp)], sizeof(ki));
             memcpy(&kd, &packet->payload[sizeof(kp) + sizeof(ki)], sizeof(kd));
@@ -1697,15 +1741,39 @@ static void handle_send_command(const comms_packet_view_t *packet)
                        &packet->payload[sizeof(kp) + sizeof(ki) + sizeof(kd) + sizeof(motor_limit_percent)],
                        sizeof(aux_percent));
             }
-            ret = control_save_pid_settings(kp, ki, kd, motor_limit_percent, aux_percent);
+            if (packet->payload_len >= line_len) {
+                memcpy(&line_max_correction,
+                       &packet->payload[aux_len],
+                       sizeof(line_max_correction));
+                memcpy(&line_base_speed,
+                       &packet->payload[aux_len + sizeof(line_max_correction)],
+                       sizeof(line_base_speed));
+                memcpy(&line_derivative_alpha,
+                       &packet->payload[aux_len + sizeof(line_max_correction) + sizeof(line_base_speed)],
+                       sizeof(line_derivative_alpha));
+                ret = control_set_line_controller(kp,
+                                                  ki,
+                                                  kd,
+                                                  line_max_correction,
+                                                  line_base_speed,
+                                                  line_derivative_alpha);
+            } else {
+                ret = ESP_OK;
+            }
+            if (ret == ESP_OK) {
+                ret = control_save_pid_settings(kp, ki, kd, motor_limit_percent, aux_percent);
+            }
         }
         ESP_LOGI(TAG,
-                 "SEND control save pid kp=%.3f ki=%.3f kd=%.3f limit=%u aux=%u ret=%s",
+                 "SEND control save pid kp=%.3f kn=%.3f kd=%.3f limit=%u aux=%u line_max=%.1f base=%.1f d_alpha=%.3f ret=%s",
                  kp,
                  ki,
                  kd,
                  (unsigned int)motor_limit_percent,
                  (unsigned int)aux_percent,
+                 line_max_correction,
+                 line_base_speed,
+                 line_derivative_alpha,
                  esp_err_to_name(ret));
         notify_status(ret == ESP_OK ? COMMS_ERROR_OK : COMMS_ERROR_INTERNAL);
         break;
