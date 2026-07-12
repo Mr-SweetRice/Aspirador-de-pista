@@ -1,0 +1,5 @@
+idf_component_register(
+    SRCS "safety.c"
+    INCLUDE_DIRS "include"
+    REQUIRES battery_level imu line_sensor esp_timer freertos log nvs_flash memory
+)
