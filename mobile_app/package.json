@@ -1,0 +1,35 @@
+{
+  "name": "aspirador-de-pista-mobile",
+  "version": "0.1.0",
+  "private": true,
+  "main": "index.ts",
+  "scripts": {
+    "start": "expo start --dev-client",
+    "android": "expo run:android",
+    "ios": "expo run:ios",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test src/protocol/protocol.test.ts src/ble/CommandQueue.test.ts",
+    "validate": "npm run typecheck && npm test",
+    "export:android": "expo export --platform android"
+  },
+  "dependencies": {
+    "@react-native-async-storage/async-storage": "3.1.1",
+    "base64-js": "^1.5.1",
+    "expo": "~57.0.7",
+    "expo-dev-client": "~57.0.7",
+    "expo-keep-awake": "~57.0.1",
+    "expo-secure-store": "~57.0.1",
+    "expo-status-bar": "~57.0.1",
+    "react": "19.2.3",
+    "react-native": "0.86.0",
+    "react-native-ble-plx": "3.5.1",
+    "react-native-safe-area-context": "~5.8.0"
+  },
+  "devDependencies": {
+    "@types/base64-js": "^1.5.0",
+    "@types/react": "~19.2.2",
+    "tsx": "^4.21.0",
+    "typescript": "~6.0.3",
+    "@types/node": "26.1.1"
+  }
+}

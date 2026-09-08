@@ -22,6 +22,7 @@ typedef struct {
     bool calibrating;
     line_sensor_track_type_t track_type;
     uint8_t threshold_percent;
+    uint8_t filter_percent;
     float read_hz;
 } line_sensor_state_t;
 
@@ -30,6 +31,8 @@ esp_err_t line_sensor_sample_now(void);
 esp_err_t line_sensor_start_calibration(uint32_t duration_ms);
 esp_err_t line_sensor_set_track_type(line_sensor_track_type_t track_type);
 esp_err_t line_sensor_set_threshold_percent(uint8_t threshold_percent);
+esp_err_t line_sensor_set_filter_percent(uint8_t filter_percent);
+esp_err_t line_sensor_set_mapping_mode(bool enabled);
 line_sensor_track_type_t line_sensor_get_track_type(void);
 bool line_sensor_get_state(line_sensor_state_t *out_state);
 

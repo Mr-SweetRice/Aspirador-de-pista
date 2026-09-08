@@ -1,8 +1,11 @@
 #include "comms_ble.h"
 
 #include <assert.h>
+#include <ctype.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdatomic.h>
+#include <stdio.h>
 #include <string.h>
 
 #include "comms_protocol.h"
@@ -31,21 +34,22 @@
 #include "odometry.h"
 #include "rgb_led.h"
 #include "safety.h"
+#include "portal_sensor.h"
 #include "services/gap/ble_svc_gap.h"
 #include "services/gatt/ble_svc_gatt.h"
 #include "store/config/ble_store_config.h"
 
 static const char *TAG = "comms_ble";
 
-#define COMMS_BLE_TASK_CORE_ID 0
+#define COMMS_BLE_TASK_CORE_ID 1
+#define COMMS_BLE_TELEMETRY_TASK_CORE_ID 0
 #define COMMS_BLE_TELEMETRY_TASK_PRIORITY 3
 #define COMMS_BLE_TX_TASK_PRIORITY 4
 #define COMMS_BLE_MAP_SAVE_TASK_PRIORITY 3
-#define COMMS_BLE_SENSOR_TELEMETRY_TARGET_HZ 120
-#define COMMS_BLE_REMAINING_TELEMETRY_TARGET_HZ 30
+#define COMMS_BLE_SENSOR_TELEMETRY_TARGET_HZ 60
+#define COMMS_BLE_REMAINING_TELEMETRY_TARGET_HZ 60
 #define COMMS_BLE_SENSOR_TELEMETRY_PERIOD_US (1000000 / COMMS_BLE_SENSOR_TELEMETRY_TARGET_HZ)
-#define COMMS_BLE_FULL_LINE_TELEMETRY_DIVIDER \
-    (COMMS_BLE_SENSOR_TELEMETRY_TARGET_HZ / COMMS_BLE_REMAINING_TELEMETRY_TARGET_HZ)
+#define COMMS_BLE_FULL_LINE_TELEMETRY_DIVIDER 2
 #define COMMS_BLE_REGULAR_TELEMETRY_DIVIDER \
     (COMMS_BLE_SENSOR_TELEMETRY_TARGET_HZ / COMMS_BLE_REMAINING_TELEMETRY_TARGET_HZ)
 #define COMMS_BLE_BUNDLE_NOTIFY_MIN_LEN 120
@@ -54,9 +58,10 @@ static const char *TAG = "comms_ble";
 #define COMMS_BLE_TX_QUEUE_DEPTH 16
 #define COMMS_BLE_NOTIFY_TX_TIMEOUT_MS 30
 #define COMMS_BLE_NOTIFY_TX_BACKOFF_MS 100
-#define COMMS_BLE_BULK_QUIET_MS 1200
-#define COMMS_BLE_CONN_ITVL_MIN 12
-#define COMMS_BLE_CONN_ITVL_MAX 24
+#define COMMS_BLE_BULK_QUIET_MS 120
+/* Units of 1.25 ms: request 7.5--15 ms, central chooses the actual interval. */
+#define COMMS_BLE_CONN_ITVL_MIN 6
+#define COMMS_BLE_CONN_ITVL_MAX 12
 #define COMMS_BLE_CONN_LATENCY 0
 #define COMMS_BLE_CONN_TIMEOUT 600
 
@@ -68,13 +73,28 @@ static const char *TAG = "comms_ble";
 static uint8_t own_addr_type;
 static uint16_t active_conn_handle;
 static uint16_t telemetry_value_handle;
+static uint16_t serial_tx_value_handle;
 static bool has_active_connection;
 static bool is_authenticated;
 static bool telemetry_subscribed;
+static bool serial_subscribed;
 static TaskHandle_t tx_task_handle;
 static TaskHandle_t telemetry_task_handle;
 static TaskHandle_t map_save_task_handle;
 static QueueHandle_t tx_queue;
+static QueueHandle_t command_queue;
+static TaskHandle_t command_task_handle;
+static atomic_uint connection_generation;
+#define COMMS_BLE_COMMAND_QUEUE_DEPTH 16
+#define COMMS_BLE_COMMAND_TASK_PRIORITY 5
+
+typedef struct {
+    uint8_t data[4 + COMMS_MAX_PAYLOAD_LEN];
+    uint16_t len;
+    unsigned generation;
+    bool serial;
+    int64_t received_us;
+} comms_ble_command_item_t;
 static esp_timer_handle_t telemetry_timer_handle;
 static int64_t telemetry_quiet_until_us;
 static int64_t auth_deadline_us;
@@ -98,6 +118,7 @@ static uint32_t notify_fail_count;
 static uint32_t command_write_count;
 static uint32_t regular_telemetry_seq;
 static uint32_t telemetry_tick_seq;
+static atomic_bool telemetry_packet_enabled[256];
 static uint16_t active_att_mtu = COMMS_BLE_DEFAULT_ATT_MTU;
 static volatile bool notify_in_flight;
 static int64_t telemetry_tx_backoff_until_us;
@@ -105,9 +126,44 @@ static configRUN_TIME_COUNTER_TYPE cpu_last_idle_runtime[2];
 static int64_t cpu_last_sample_us;
 static float cpu_usage_percent[2];
 
+static bool configurable_telemetry_id(uint8_t message_id)
+{
+    switch (message_id) {
+    case COMMS_TELE_ENCODERS:
+    case COMMS_TELE_LINE:
+    case COMMS_TELE_ODOMETRY:
+    case COMMS_TELE_BATTERY:
+    case COMMS_TELE_IMU:
+    case COMMS_TELE_POSE:
+    case COMMS_TELE_LINE_FAST:
+    case COMMS_TELE_IMU_FAST:
+    case COMMS_TELE_CONTROL:
+    case COMMS_TELE_RGB_LED:
+    case COMMS_TELE_SAFETY:
+    case COMMS_TELE_SYSTEM:
+    case COMMS_TELE_PORTAL:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool telemetry_is_enabled(uint8_t message_id)
+{
+    return atomic_load_explicit(&telemetry_packet_enabled[message_id], memory_order_relaxed);
+}
+
+static void reset_telemetry_packet_config(void)
+{
+    for (size_t i = 0; i < sizeof(telemetry_packet_enabled) / sizeof(telemetry_packet_enabled[0]); ++i) {
+        atomic_store_explicit(&telemetry_packet_enabled[i], true, memory_order_relaxed);
+    }
+}
+
 typedef struct {
     uint8_t packet[4 + COMMS_MAX_PAYLOAD_LEN];
     uint16_t len;
+    unsigned generation;
     char label[18];
 } comms_ble_tx_item_t;
 
@@ -125,6 +181,17 @@ static const ble_uuid128_t command_uuid =
 static const ble_uuid128_t telemetry_uuid =
     BLE_UUID128_INIT(0x01, 0x00, 0x8d, 0x2b, 0x6c, 0x7a, 0x4f, 0x9d,
                      0x7d, 0x4a, 0x5a, 0x8f, 0x03, 0x00, 0x7a, 0x5d);
+
+/* Nordic UART Service (NUS), reconhecido pelo Serial Bluetooth Terminal. */
+static const ble_uuid128_t serial_service_uuid =
+    BLE_UUID128_INIT(0x9e, 0xca, 0xdc, 0x24, 0x0e, 0xe5, 0xa9, 0xe0,
+                     0x93, 0xf3, 0xa3, 0xb5, 0x01, 0x00, 0x40, 0x6e);
+static const ble_uuid128_t serial_rx_uuid =
+    BLE_UUID128_INIT(0x9e, 0xca, 0xdc, 0x24, 0x0e, 0xe5, 0xa9, 0xe0,
+                     0x93, 0xf3, 0xa3, 0xb5, 0x02, 0x00, 0x40, 0x6e);
+static const ble_uuid128_t serial_tx_uuid =
+    BLE_UUID128_INIT(0x9e, 0xca, 0xdc, 0x24, 0x0e, 0xe5, 0xa9, 0xe0,
+                     0x93, 0xf3, 0xa3, 0xb5, 0x03, 0x00, 0x40, 0x6e);
 
 static int comms_gap_event(struct ble_gap_event *event, void *arg);
 
@@ -315,6 +382,7 @@ static bool build_system_telemetry_packet(uint8_t *buffer, uint16_t buffer_len, 
     const comms_system_telemetry_payload_t payload = {
         .cpu0_percent = cpu_usage_percent[0],
         .cpu1_percent = cpu_usage_percent[1],
+        .flags = motors_get_zero_brake_enabled() ? COMMS_SYSTEM_FLAG_ZERO_BRAKE_ENABLED : 0,
     };
 
     buffer[0] = COMMS_PROTOCOL_VERSION;
@@ -324,6 +392,21 @@ static bool build_system_telemetry_packet(uint8_t *buffer, uint16_t buffer_len, 
     memcpy(&buffer[4], &payload, sizeof(payload));
     *out_len = 4 + sizeof(payload);
     return true;
+}
+
+static bool build_portal_telemetry_packet(uint8_t *buffer, uint16_t buffer_len, uint16_t *out_len)
+{
+    portal_sensor_state_t portal = {0};
+    if (buffer_len < 4 + sizeof(comms_portal_telemetry_payload_t) || !portal_sensor_get_state(&portal)) return false;
+    const comms_portal_telemetry_payload_t payload = {
+        .enabled = portal.enabled, .sensor_ok = portal.sensor_ok, .detected = portal.detected,
+        .count = portal.count, .stopping = portal.stopping, .distance_mm = portal.distance_mm,
+        .threshold_mm = portal.threshold_mm, .stop_speed_percent = portal.stop_speed_percent,
+        .stop_delay_ms = portal.stop_delay_ms, .gpio1_active = portal.gpio1_active,
+        .gpio1_events = portal.gpio1_events,
+    };
+    buffer[0] = COMMS_PROTOCOL_VERSION; buffer[1] = COMMS_CMD_CLASS_TELE; buffer[2] = COMMS_TELE_PORTAL; buffer[3] = sizeof(payload);
+    memcpy(&buffer[4], &payload, sizeof(payload)); *out_len = 4 + sizeof(payload); return true;
 }
 
 static bool build_imu_telemetry_packet(uint8_t *buffer, uint16_t buffer_len, uint16_t *out_len)
@@ -339,40 +422,6 @@ static bool build_imu_telemetry_packet(uint8_t *buffer, uint16_t buffer_len, uin
     payload.roll_deg = imu.roll_deg;
     payload.pitch_deg = imu.pitch_deg;
     payload.yaw_deg = imu.yaw_deg;
-    payload.mag_yaw_deg = imu.mag_yaw_deg;
-    payload.mag_yaw_xy_deg = imu.mag_yaw_xy_deg;
-    payload.mag_yaw_xz_deg = imu.mag_yaw_xz_deg;
-    payload.mag_yaw_yz_deg = imu.mag_yaw_yz_deg;
-    payload.mag_yaw_error_deg = imu.mag_yaw_error_deg;
-    payload.mag_field_norm_ut = imu.mag_field_norm_ut;
-    payload.mag_filter_gain = imu.mag_filter_gain;
-    payload.yaw_drift_threshold_dps = imu.yaw_drift_threshold_dps;
-    memcpy(payload.quat_wxyz, imu.quat_wxyz, sizeof(payload.quat_wxyz));
-    memcpy(payload.accel_mps2, imu.accel_mps2, sizeof(payload.accel_mps2));
-    memcpy(payload.gyro_dps, imu.gyro_dps, sizeof(payload.gyro_dps));
-    memcpy(payload.mag_ut, imu.mag_ut, sizeof(payload.mag_ut));
-    payload.mag_heading_mode = imu.mag_heading_mode;
-    if (imu.mag_ignored) {
-        payload.flags |= COMMS_IMU_FLAG_MAG_IGNORED;
-    }
-    if (imu.mag_calibrating) {
-        payload.flags |= COMMS_IMU_FLAG_MAG_CALIBRATING;
-    }
-    if (imu.mag_calibrated) {
-        payload.flags |= COMMS_IMU_FLAG_MAG_CALIBRATED;
-    }
-    if (imu.accel_gyro_calibrating) {
-        payload.flags |= COMMS_IMU_FLAG_ACCEL_GYRO_CALIBRATING;
-    }
-    if (imu.accel_gyro_calibrated) {
-        payload.flags |= COMMS_IMU_FLAG_ACCEL_GYRO_CALIBRATED;
-    }
-    if (imu.yaw_drift_calibrating) {
-        payload.flags |= COMMS_IMU_FLAG_YAW_DRIFT_CALIBRATING;
-    }
-    if (imu.yaw_drift_calibrated) {
-        payload.flags |= COMMS_IMU_FLAG_YAW_DRIFT_CALIBRATED;
-    }
 
     buffer[0] = COMMS_PROTOCOL_VERSION;
     buffer[1] = COMMS_CMD_CLASS_TELE;
@@ -387,7 +436,7 @@ static bool build_imu_telemetry_packet(uint8_t *buffer, uint16_t buffer_len, uin
 static bool build_imu_fast_telemetry_packet(uint8_t *buffer, uint16_t buffer_len, uint16_t *out_len)
 {
     imu_state_t imu = {0};
-    comms_imu_fast_telemetry_payload_t payload = {0};
+    comms_imu_telemetry_payload_t payload = {0};
     const uint16_t packet_len = 4 + sizeof(payload);
 
     if (buffer_len < packet_len || !imu_get_state(&imu)) {
@@ -397,30 +446,6 @@ static bool build_imu_fast_telemetry_packet(uint8_t *buffer, uint16_t buffer_len
     payload.roll_deg = imu.roll_deg;
     payload.pitch_deg = imu.pitch_deg;
     payload.yaw_deg = imu.yaw_deg;
-    payload.gyro_z_dps = imu.gyro_dps[2];
-    payload.sample_hz = imu.sample_hz;
-    payload.mag_heading_mode = imu.mag_heading_mode;
-    if (imu.mag_ignored) {
-        payload.flags |= COMMS_IMU_FLAG_MAG_IGNORED;
-    }
-    if (imu.mag_calibrating) {
-        payload.flags |= COMMS_IMU_FLAG_MAG_CALIBRATING;
-    }
-    if (imu.mag_calibrated) {
-        payload.flags |= COMMS_IMU_FLAG_MAG_CALIBRATED;
-    }
-    if (imu.accel_gyro_calibrating) {
-        payload.flags |= COMMS_IMU_FLAG_ACCEL_GYRO_CALIBRATING;
-    }
-    if (imu.accel_gyro_calibrated) {
-        payload.flags |= COMMS_IMU_FLAG_ACCEL_GYRO_CALIBRATED;
-    }
-    if (imu.yaw_drift_calibrating) {
-        payload.flags |= COMMS_IMU_FLAG_YAW_DRIFT_CALIBRATING;
-    }
-    if (imu.yaw_drift_calibrated) {
-        payload.flags |= COMMS_IMU_FLAG_YAW_DRIFT_CALIBRATED;
-    }
 
     buffer[0] = COMMS_PROTOCOL_VERSION;
     buffer[1] = COMMS_CMD_CLASS_TELE;
@@ -595,6 +620,7 @@ static bool build_control_telemetry_packet(uint8_t *buffer, uint16_t buffer_len,
     payload.race_segment_aux_percent = control.race_segment_aux_percent;
     payload.active_speed_percent = control.active_speed_percent;
     payload.race_plan_average_speed_mps = control.race_plan_average_speed_mps;
+    payload.line_alpha = control.line_alpha;
 
     buffer[0] = COMMS_PROTOCOL_VERSION;
     buffer[1] = COMMS_CMD_CLASS_TELE;
@@ -623,6 +649,7 @@ static bool build_line_telemetry_packet(uint8_t *buffer, uint16_t buffer_len, ui
     payload.track_type = (uint8_t)line.track_type;
     payload.threshold_percent = line.threshold_percent;
     payload.read_hz = line.read_hz;
+    payload.filter_percent = line.filter_percent;
     if (line.line_visible) {
         payload.flags |= 1U << 0;
     }
@@ -657,6 +684,7 @@ static bool build_line_fast_telemetry_packet(uint8_t *buffer, uint16_t buffer_le
     payload.track_type = (uint8_t)line.track_type;
     payload.threshold_percent = line.threshold_percent;
     payload.read_hz = line.read_hz;
+    payload.filter_percent = line.filter_percent;
     if (line.line_visible) {
         payload.flags |= 1U << 0;
     }
@@ -747,12 +775,20 @@ static bool build_safety_telemetry_packet(uint8_t *buffer, uint16_t buffer_len, 
     if (safety.ble_connected) {
         payload.flags |= 1U << 10;
     }
+    if (safety.distance_limit_enabled) {
+        payload.flags |= 1U << 11;
+    }
+    if (safety.distance_limit_active) {
+        payload.flags |= 1U << 12;
+    }
     payload.roll_limit_deg = safety.roll_limit_deg;
     payload.battery_block_percent = safety.battery_block_percent;
     payload.current_roll_deg = safety.current_roll_deg;
     payload.current_battery_percent = safety.current_battery_percent;
     payload.line_loss_timeout_s = safety.line_loss_timeout_s;
     payload.line_loss_elapsed_s = safety.line_loss_elapsed_s;
+    payload.distance_limit_m = safety.distance_limit_m;
+    payload.distance_traveled_m = safety.distance_traveled_m;
 
     buffer[0] = COMMS_PROTOCOL_VERSION;
     buffer[1] = COMMS_CMD_CLASS_TELE;
@@ -860,6 +896,7 @@ static void notify_packet(const uint8_t *packet, uint16_t packet_len, const char
 
     memcpy(item.packet, packet, packet_len);
     item.len = packet_len;
+    item.generation = atomic_load(&connection_generation);
     strncpy(item.label, label, sizeof(item.label) - 1);
 
     const bool priority = is_priority_notify_label(label);
@@ -867,14 +904,8 @@ static void notify_packet(const uint8_t *packet, uint16_t packet_len, const char
         return;
     }
 
-    BaseType_t queued = priority
-                            ? xQueueSendToFront(tx_queue, &item, 0)
-                            : xQueueSend(tx_queue, &item, 0);
-    if (queued != pdPASS) {
-        comms_ble_tx_item_t dropped = {0};
-        (void)xQueueReceive(tx_queue, &dropped, 0);
-        queued = priority ? xQueueSendToFront(tx_queue, &item, 0) : xQueueSend(tx_queue, &item, 0);
-    }
+    /* Preserve response order; never evict an earlier status/map response. */
+    BaseType_t queued = xQueueSend(tx_queue, &item, 0);
 
     if (queued != pdPASS) {
         ++notify_fail_count;
@@ -892,13 +923,21 @@ static void tx_task(void *param)
             continue;
         }
 
-        if (!can_notify_now()) {
+        if (!can_notify_now() || item.generation != atomic_load(&connection_generation)) {
             continue;
         }
 
         (void)ulTaskNotifyTake(pdTRUE, 0);
         notify_in_flight = true;
         int rc = notify_packet_direct(item.packet, item.len, item.label);
+        /* Retry only submissions rejected before acceptance. A successful notify
+           with a late completion must not be replayed (duplicate map/status). */
+        for (unsigned attempt = 1; attempt < 3 && is_priority_notify_label(item.label) &&
+             (rc == BLE_HS_ENOMEM || rc == BLE_HS_EBUSY || rc == BLE_HS_EAGAIN); ++attempt) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+            if (!can_notify_now() || item.generation != atomic_load(&connection_generation)) break;
+            rc = notify_packet_direct(item.packet, item.len, item.label);
+        }
         if (rc == 0) {
             const BaseType_t confirmed = ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(COMMS_BLE_NOTIFY_TX_TIMEOUT_MS));
             if (confirmed == 0) {
@@ -926,9 +965,6 @@ static void pause_regular_telemetry(uint32_t duration_ms)
 static void start_bulk_tx_window(uint32_t duration_ms)
 {
     pause_regular_telemetry(duration_ms);
-    if (tx_queue != NULL) {
-        xQueueReset(tx_queue);
-    }
 }
 
 static void notify_status(uint8_t status)
@@ -1082,7 +1118,7 @@ static void append_regular_telemetry_slot_to_bundle(uint8_t *bundle_payload,
     const uint32_t slot = regular_telemetry_seq++ % 4U;
     switch (slot) {
     case 0:
-        if (build_control_telemetry_packet(item, sizeof(item), &packet_len)) {
+        if (telemetry_is_enabled(COMMS_TELE_CONTROL) && build_control_telemetry_packet(item, sizeof(item), &packet_len)) {
             append_telemetry_packet_to_bundle_if_fits(bundle_payload,
                                                       bundle_payload_len,
                                                       COMMS_MAX_PAYLOAD_LEN,
@@ -1090,7 +1126,7 @@ static void append_regular_telemetry_slot_to_bundle(uint8_t *bundle_payload,
                                                       item,
                                                       packet_len);
         }
-        if (build_system_telemetry_packet(item, sizeof(item), &packet_len)) {
+        if (telemetry_is_enabled(COMMS_TELE_SYSTEM) && build_system_telemetry_packet(item, sizeof(item), &packet_len)) {
             append_telemetry_packet_to_bundle_if_fits(bundle_payload,
                                                       bundle_payload_len,
                                                       COMMS_MAX_PAYLOAD_LEN,
@@ -1100,7 +1136,7 @@ static void append_regular_telemetry_slot_to_bundle(uint8_t *bundle_payload,
         }
         break;
     case 1:
-        if (build_odometry_telemetry_packet(item, sizeof(item), &packet_len)) {
+        if (telemetry_is_enabled(COMMS_TELE_ODOMETRY) && build_odometry_telemetry_packet(item, sizeof(item), &packet_len)) {
             append_telemetry_packet_to_bundle_if_fits(bundle_payload,
                                                       bundle_payload_len,
                                                       COMMS_MAX_PAYLOAD_LEN,
@@ -1108,7 +1144,7 @@ static void append_regular_telemetry_slot_to_bundle(uint8_t *bundle_payload,
                                                       item,
                                                       packet_len);
         }
-        if (build_encoder_telemetry_packet(item, sizeof(item), &packet_len)) {
+        if (telemetry_is_enabled(COMMS_TELE_ENCODERS) && build_encoder_telemetry_packet(item, sizeof(item), &packet_len)) {
             append_telemetry_packet_to_bundle_if_fits(bundle_payload,
                                                       bundle_payload_len,
                                                       COMMS_MAX_PAYLOAD_LEN,
@@ -1116,7 +1152,7 @@ static void append_regular_telemetry_slot_to_bundle(uint8_t *bundle_payload,
                                                       item,
                                                       packet_len);
         }
-        if (build_battery_telemetry_packet(item, sizeof(item), &packet_len)) {
+        if (telemetry_is_enabled(COMMS_TELE_BATTERY) && build_battery_telemetry_packet(item, sizeof(item), &packet_len)) {
             append_telemetry_packet_to_bundle_if_fits(bundle_payload,
                                                       bundle_payload_len,
                                                       COMMS_MAX_PAYLOAD_LEN,
@@ -1126,7 +1162,7 @@ static void append_regular_telemetry_slot_to_bundle(uint8_t *bundle_payload,
         }
         break;
     case 2:
-        if (build_imu_telemetry_packet(item, sizeof(item), &packet_len)) {
+        if (telemetry_is_enabled(COMMS_TELE_IMU) && build_imu_telemetry_packet(item, sizeof(item), &packet_len)) {
             append_telemetry_packet_to_bundle_if_fits(bundle_payload,
                                                       bundle_payload_len,
                                                       COMMS_MAX_PAYLOAD_LEN,
@@ -1136,7 +1172,10 @@ static void append_regular_telemetry_slot_to_bundle(uint8_t *bundle_payload,
         }
         break;
     default:
-        if (build_safety_telemetry_packet(item, sizeof(item), &packet_len)) {
+        if (telemetry_is_enabled(COMMS_TELE_PORTAL) && build_portal_telemetry_packet(item, sizeof(item), &packet_len)) {
+            append_telemetry_packet_to_bundle_if_fits(bundle_payload, bundle_payload_len, COMMS_MAX_PAYLOAD_LEN, max_notify_len, item, packet_len);
+        }
+        if (telemetry_is_enabled(COMMS_TELE_SAFETY) && build_safety_telemetry_packet(item, sizeof(item), &packet_len)) {
             append_telemetry_packet_to_bundle_if_fits(bundle_payload,
                                                       bundle_payload_len,
                                                       COMMS_MAX_PAYLOAD_LEN,
@@ -1144,7 +1183,7 @@ static void append_regular_telemetry_slot_to_bundle(uint8_t *bundle_payload,
                                                       item,
                                                       packet_len);
         }
-        if (build_rgb_led_telemetry_packet(item, sizeof(item), &packet_len)) {
+        if (telemetry_is_enabled(COMMS_TELE_RGB_LED) && build_rgb_led_telemetry_packet(item, sizeof(item), &packet_len)) {
             append_telemetry_packet_to_bundle_if_fits(bundle_payload,
                                                       bundle_payload_len,
                                                       COMMS_MAX_PAYLOAD_LEN,
@@ -1152,7 +1191,7 @@ static void append_regular_telemetry_slot_to_bundle(uint8_t *bundle_payload,
                                                       item,
                                                       packet_len);
         }
-        if (build_system_telemetry_packet(item, sizeof(item), &packet_len)) {
+        if (telemetry_is_enabled(COMMS_TELE_SYSTEM) && build_system_telemetry_packet(item, sizeof(item), &packet_len)) {
             append_telemetry_packet_to_bundle_if_fits(bundle_payload,
                                                       bundle_payload_len,
                                                       COMMS_MAX_PAYLOAD_LEN,
@@ -1182,7 +1221,7 @@ static void send_high_rate_sensor_telemetry_notification(uint32_t tick)
     const bool regular_telemetry_allowed = esp_timer_get_time() >= telemetry_quiet_until_us;
     const uint16_t max_notify_len = current_max_notify_len();
 
-    if (build_pose_telemetry_packet(item, sizeof(item), &packet_len)) {
+    if (telemetry_is_enabled(COMMS_TELE_POSE) && build_pose_telemetry_packet(item, sizeof(item), &packet_len)) {
         append_telemetry_packet_to_bundle_if_fits(&packet[4],
                                                   &bundle_payload_len,
                                                   COMMS_MAX_PAYLOAD_LEN,
@@ -1191,7 +1230,7 @@ static void send_high_rate_sensor_telemetry_notification(uint32_t tick)
                                                   packet_len);
     }
 
-    if (build_imu_fast_telemetry_packet(item, sizeof(item), &packet_len)) {
+    if (telemetry_is_enabled(COMMS_TELE_IMU_FAST) && build_imu_fast_telemetry_packet(item, sizeof(item), &packet_len)) {
         append_telemetry_packet_to_bundle_if_fits(&packet[4],
                                                   &bundle_payload_len,
                                                   COMMS_MAX_PAYLOAD_LEN,
@@ -1200,18 +1239,7 @@ static void send_high_rate_sensor_telemetry_notification(uint32_t tick)
                                                   packet_len);
     }
 
-    if (build_line_fast_telemetry_packet(item, sizeof(item), &packet_len)) {
-        append_telemetry_packet_to_bundle_if_fits(&packet[4],
-                                                  &bundle_payload_len,
-                                                  COMMS_MAX_PAYLOAD_LEN,
-                                                  max_notify_len,
-                                                  item,
-                                                  packet_len);
-    }
-
-    if (regular_telemetry_allowed &&
-        (tick % COMMS_BLE_FULL_LINE_TELEMETRY_DIVIDER) == 0U &&
-        build_line_telemetry_packet(item, sizeof(item), &packet_len)) {
+    if (telemetry_is_enabled(COMMS_TELE_LINE_FAST) && build_line_fast_telemetry_packet(item, sizeof(item), &packet_len)) {
         append_telemetry_packet_to_bundle_if_fits(&packet[4],
                                                   &bundle_payload_len,
                                                   COMMS_MAX_PAYLOAD_LEN,
@@ -1222,11 +1250,30 @@ static void send_high_rate_sensor_telemetry_notification(uint32_t tick)
 
     if (regular_telemetry_allowed && (tick % COMMS_BLE_REGULAR_TELEMETRY_DIVIDER) == 0U) {
         append_regular_telemetry_slot_to_bundle(&packet[4], &bundle_payload_len, max_notify_len);
+    } else if (!regular_telemetry_allowed && tick % 4U == 0U &&
+               telemetry_is_enabled(COMMS_TELE_ODOMETRY) &&
+               build_odometry_telemetry_packet(item, sizeof(item), &packet_len)) {
+        /* Map transfer quiet windows must not suppress odometry snapshots. */
+        append_telemetry_packet_to_bundle_if_fits(&packet[4], &bundle_payload_len,
+                                                COMMS_MAX_PAYLOAD_LEN, max_notify_len, item, packet_len);
+    }
+
+    if (regular_telemetry_allowed &&
+        (tick % COMMS_BLE_FULL_LINE_TELEMETRY_DIVIDER) == 0U &&
+        telemetry_is_enabled(COMMS_TELE_LINE) &&
+        build_line_telemetry_packet(item, sizeof(item), &packet_len)) {
+        append_telemetry_packet_to_bundle_if_fits(&packet[4],
+                                                  &bundle_payload_len,
+                                                  COMMS_MAX_PAYLOAD_LEN,
+                                                  max_notify_len,
+                                                  item,
+                                                  packet_len);
     }
 
     if (finish_bundle_packet(packet, sizeof(packet), bundle_payload_len, &packet_len)) {
         notify_packet(packet, packet_len, "sensor fast");
-    } else if (build_pose_telemetry_packet(packet, sizeof(packet), &packet_len)) {
+    } else if (telemetry_is_enabled(COMMS_TELE_POSE) &&
+               build_pose_telemetry_packet(packet, sizeof(packet), &packet_len)) {
         notify_packet(packet, packet_len, "pose telemetry");
     }
 }
@@ -1438,6 +1485,15 @@ static void handle_read_command(const comms_packet_view_t *packet)
     }
 }
 
+static esp_err_t set_manual_motor_percent(motors_motor_id_t motor, int percent)
+{
+    control_navigation_state_t navigation = {0};
+    if (control_get_navigation_state(&navigation) && navigation.running) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    return motors_set_percent(motor, percent);
+}
+
 static void handle_send_command(const comms_packet_view_t *packet)
 {
     switch (packet->message_id) {
@@ -1448,50 +1504,69 @@ static void handle_send_command(const comms_packet_view_t *packet)
         break;
     }
     case COMMS_SEND_MOVE_FORWARD: {
-        esp_err_t left_ret = motors_set_percent(MOTORS_MOTOR_LEFT, MOTORS_DEFAULT_SPEED_PERCENT);
-        esp_err_t right_ret = motors_set_percent(MOTORS_MOTOR_RIGHT, MOTORS_DEFAULT_SPEED_PERCENT);
+        esp_err_t left_ret = set_manual_motor_percent(MOTORS_MOTOR_LEFT, MOTORS_DEFAULT_SPEED_PERCENT);
+        esp_err_t right_ret = set_manual_motor_percent(MOTORS_MOTOR_RIGHT, MOTORS_DEFAULT_SPEED_PERCENT);
         ESP_LOGI(TAG,
                  "SEND move forward speed=%d ret L=%s R=%s",
                  MOTORS_DEFAULT_SPEED_PERCENT,
                  esp_err_to_name(left_ret),
                  esp_err_to_name(right_ret));
+        if (left_ret != ESP_OK || right_ret != ESP_OK) notify_status(COMMS_ERROR_INTERNAL);
         break;
     }
     case COMMS_SEND_MOVE_BACKWARD: {
-        esp_err_t left_ret = motors_set_percent(MOTORS_MOTOR_LEFT, -MOTORS_DEFAULT_SPEED_PERCENT);
-        esp_err_t right_ret = motors_set_percent(MOTORS_MOTOR_RIGHT, -MOTORS_DEFAULT_SPEED_PERCENT);
+        esp_err_t left_ret = set_manual_motor_percent(MOTORS_MOTOR_LEFT, -MOTORS_DEFAULT_SPEED_PERCENT);
+        esp_err_t right_ret = set_manual_motor_percent(MOTORS_MOTOR_RIGHT, -MOTORS_DEFAULT_SPEED_PERCENT);
         ESP_LOGI(TAG,
                  "SEND move backward speed=%d ret L=%s R=%s",
                  MOTORS_DEFAULT_SPEED_PERCENT,
                  esp_err_to_name(left_ret),
                  esp_err_to_name(right_ret));
+        if (left_ret != ESP_OK || right_ret != ESP_OK) notify_status(COMMS_ERROR_INTERNAL);
         break;
     }
     case COMMS_SEND_SET_LEFT_PWM: {
+        if (packet->payload_len != 1) { notify_status(COMMS_ERROR_INVALID_PACKET); break; }
         int8_t percent = 0;
         if (packet->payload_len >= sizeof(percent)) {
             memcpy(&percent, packet->payload, sizeof(percent));
         }
-        esp_err_t ret = motors_set_percent(MOTORS_MOTOR_LEFT, percent);
-        ESP_LOGI(TAG, "SEND left pwm=%d ret=%s", (int)percent, esp_err_to_name(ret));
+        esp_err_t ret = set_manual_motor_percent(MOTORS_MOTOR_LEFT, percent);
+        if (ret != ESP_OK) notify_status(COMMS_ERROR_INTERNAL);
         break;
     }
     case COMMS_SEND_SET_RIGHT_PWM: {
+        if (packet->payload_len != 1) { notify_status(COMMS_ERROR_INVALID_PACKET); break; }
         int8_t percent = 0;
         if (packet->payload_len >= sizeof(percent)) {
             memcpy(&percent, packet->payload, sizeof(percent));
         }
-        esp_err_t ret = motors_set_percent(MOTORS_MOTOR_RIGHT, percent);
-        ESP_LOGI(TAG, "SEND right pwm=%d ret=%s", (int)percent, esp_err_to_name(ret));
+        esp_err_t ret = set_manual_motor_percent(MOTORS_MOTOR_RIGHT, percent);
+        if (ret != ESP_OK) notify_status(COMMS_ERROR_INTERNAL);
         break;
     }
     case COMMS_SEND_SET_AUX_PWM: {
+        if (packet->payload_len != 1) { notify_status(COMMS_ERROR_INVALID_PACKET); break; }
         int8_t percent = 0;
         if (packet->payload_len >= sizeof(percent)) {
             memcpy(&percent, packet->payload, sizeof(percent));
         }
-        esp_err_t ret = motors_set_percent(MOTORS_MOTOR_AUX, percent);
-        ESP_LOGI(TAG, "SEND aux pwm=%d ret=%s", (int)percent, esp_err_to_name(ret));
+        esp_err_t ret = set_manual_motor_percent(MOTORS_MOTOR_AUX, percent);
+        if (ret != ESP_OK) notify_status(COMMS_ERROR_INTERNAL);
+        break;
+    }
+    case COMMS_SEND_SET_ZERO_BRAKE_ENABLED: {
+        uint8_t enabled = 1;
+        esp_err_t ret = ESP_ERR_INVALID_SIZE;
+        if (packet->payload_len >= sizeof(enabled)) {
+            enabled = packet->payload[0];
+            ret = motors_set_zero_brake_enabled(enabled != 0);
+        }
+        ESP_LOGI(TAG,
+                 "SEND zero brake enabled=%u ret=%s",
+                 (unsigned int)enabled,
+                 esp_err_to_name(ret));
+        notify_status(ret == ESP_OK ? COMMS_ERROR_OK : COMMS_ERROR_INTERNAL);
         break;
     }
     case COMMS_SEND_CONTROL_START_MAP: {
@@ -1526,15 +1601,20 @@ static void handle_send_command(const comms_packet_view_t *packet)
     case COMMS_SEND_CONTROL_START_AUTO_TRACK: {
         uint8_t slot = 0;
         int8_t speed = 25;
+        uint8_t use_race_plan = 0;
         if (packet->payload_len >= sizeof(slot) + sizeof(speed)) {
             slot = packet->payload[0];
             memcpy(&speed, &packet->payload[1], sizeof(speed));
         }
-        esp_err_t ret = control_start_auto_track(slot, speed);
+        if (packet->payload_len >= sizeof(slot) + sizeof(speed) + sizeof(use_race_plan)) {
+            use_race_plan = packet->payload[2] ? 1U : 0U;
+        }
+        esp_err_t ret = control_start_auto_track(slot, speed, use_race_plan != 0);
         ESP_LOGI(TAG,
-                 "SEND control start auto track slot=%u speed=%d ret=%s",
+                 "SEND control start auto track slot=%u speed=%d race_plan=%u ret=%s",
                  (unsigned int)slot,
                  (int)speed,
+                 (unsigned int)use_race_plan,
                  esp_err_to_name(ret));
         notify_status(ret == ESP_OK ? COMMS_ERROR_OK : COMMS_ERROR_INTERNAL);
         break;
@@ -1648,7 +1728,9 @@ static void handle_send_command(const comms_packet_view_t *packet)
         float kp = 0.0f;
         float ki = 0.0f;
         float kd = 0.0f;
+        float alpha = 0.0f;
         uint8_t motor_limit_percent = 100;
+        bool has_alpha = false;
         if (packet->payload_len >= sizeof(kp) + sizeof(ki) + sizeof(kd)) {
             memcpy(&kp, packet->payload, sizeof(kp));
             memcpy(&ki, &packet->payload[sizeof(kp)], sizeof(ki));
@@ -1662,16 +1744,25 @@ static void handle_send_command(const comms_packet_view_t *packet)
                 motor_limit_percent = current.motor_limit_percent;
             }
         }
+        if (packet->payload_len >= sizeof(kp) + sizeof(ki) + sizeof(kd) + sizeof(motor_limit_percent) + sizeof(alpha)) {
+            memcpy(&alpha, &packet->payload[sizeof(kp) + sizeof(ki) + sizeof(kd) + sizeof(motor_limit_percent)], sizeof(alpha));
+            has_alpha = true;
+        }
         esp_err_t ret = control_set_pid(kp, ki, kd);
         if (ret == ESP_OK) {
             ret = control_set_motor_limit(motor_limit_percent);
         }
+        if (ret == ESP_OK && has_alpha) {
+            ret = control_set_line_alpha(alpha);
+        }
         ESP_LOGI(TAG,
-                 "SEND control set pid kp=%.3f ki=%.3f kd=%.3f limit=%u ret=%s",
+                 "SEND control set pid kp=%.3f ki=%.3f kd=%.3f limit=%u alpha=%.3f has_alpha=%u ret=%s",
                  kp,
                  ki,
                  kd,
                  (unsigned int)motor_limit_percent,
+                 alpha,
+                 has_alpha ? 1U : 0U,
                  esp_err_to_name(ret));
         notify_status(ret == ESP_OK ? COMMS_ERROR_OK : COMMS_ERROR_INTERNAL);
         break;
@@ -1680,8 +1771,10 @@ static void handle_send_command(const comms_packet_view_t *packet)
         float kp = 0.0f;
         float ki = 0.0f;
         float kd = 0.0f;
+        float alpha = 0.0f;
         uint8_t motor_limit_percent = 100;
         uint8_t aux_percent = 0;
+        bool has_alpha = false;
         esp_err_t ret = ESP_ERR_INVALID_SIZE;
         if (packet->payload_len >= sizeof(kp) + sizeof(ki) + sizeof(kd) + sizeof(motor_limit_percent)) {
             memcpy(&kp, packet->payload, sizeof(kp));
@@ -1697,15 +1790,26 @@ static void handle_send_command(const comms_packet_view_t *packet)
                        &packet->payload[sizeof(kp) + sizeof(ki) + sizeof(kd) + sizeof(motor_limit_percent)],
                        sizeof(aux_percent));
             }
+            if (packet->payload_len >= sizeof(kp) + sizeof(ki) + sizeof(kd) + sizeof(motor_limit_percent) + sizeof(aux_percent) + sizeof(alpha)) {
+                memcpy(&alpha,
+                       &packet->payload[sizeof(kp) + sizeof(ki) + sizeof(kd) + sizeof(motor_limit_percent) + sizeof(aux_percent)],
+                       sizeof(alpha));
+                has_alpha = true;
+            }
             ret = control_save_pid_settings(kp, ki, kd, motor_limit_percent, aux_percent);
+            if (ret == ESP_OK && has_alpha) {
+                ret = control_save_line_alpha(alpha);
+            }
         }
         ESP_LOGI(TAG,
-                 "SEND control save pid kp=%.3f ki=%.3f kd=%.3f limit=%u aux=%u ret=%s",
+                 "SEND control save pid kp=%.3f ki=%.3f kd=%.3f limit=%u aux=%u alpha=%.3f has_alpha=%u ret=%s",
                  kp,
                  ki,
                  kd,
                  (unsigned int)motor_limit_percent,
                  (unsigned int)aux_percent,
+                 alpha,
+                 has_alpha ? 1U : 0U,
                  esp_err_to_name(ret));
         notify_status(ret == ESP_OK ? COMMS_ERROR_OK : COMMS_ERROR_INTERNAL);
         break;
@@ -1809,10 +1913,12 @@ static void handle_send_command(const comms_packet_view_t *packet)
     {
         esp_err_t encoder_ret = encoder_reset();
         esp_err_t odometry_ret = odometry_reset();
+        esp_err_t safety_ret = safety_reset_distance();
         ESP_LOGI(TAG,
-                 "SEND reset encoders ret encoder=%s odometry=%s",
+                 "SEND reset encoders ret encoder=%s odometry=%s safety_distance=%s",
                  esp_err_to_name(encoder_ret),
-                 esp_err_to_name(odometry_ret));
+                 esp_err_to_name(odometry_ret),
+                 esp_err_to_name(safety_ret));
         break;
     }
     case COMMS_SEND_RESET_YAW: {
@@ -1842,6 +1948,16 @@ static void handle_send_command(const comms_packet_view_t *packet)
             ret = ESP_ERR_INVALID_STATE;
         } else {
             ret = memory_maps_record_start(name);
+            if (ret == ESP_OK) {
+                const esp_err_t control_rate_ret = control_set_mapping_mode(true);
+                const esp_err_t line_rate_ret = line_sensor_set_mapping_mode(true);
+                if (control_rate_ret != ESP_OK || line_rate_ret != ESP_OK) {
+                    (void)memory_maps_record_stop();
+                    (void)control_set_mapping_mode(false);
+                    (void)line_sensor_set_mapping_mode(false);
+                    ret = ESP_ERR_INVALID_STATE;
+                }
+            }
         }
         ESP_LOGI(TAG,
                  "SEND map record start name=%s imu=%s odometry=%s ret=%s",
@@ -1850,12 +1966,19 @@ static void handle_send_command(const comms_packet_view_t *packet)
                  esp_err_to_name(odometry_ret),
                  esp_err_to_name(ret));
         notify_status(ret == ESP_OK ? COMMS_ERROR_OK : COMMS_ERROR_INTERNAL);
+        notify_map_record_chunk(0);
         break;
     }
     case COMMS_SEND_MAP_RECORD_STOP: {
         esp_err_t ret = memory_maps_record_stop();
+        const esp_err_t control_rate_ret = control_set_mapping_mode(false);
+        const esp_err_t line_rate_ret = line_sensor_set_mapping_mode(false);
+        if (ret == ESP_OK && (control_rate_ret != ESP_OK || line_rate_ret != ESP_OK)) {
+            ret = ESP_ERR_INVALID_STATE;
+        }
         ESP_LOGI(TAG, "SEND map record stop ret=%s", esp_err_to_name(ret));
         notify_status(ret == ESP_OK ? COMMS_ERROR_OK : COMMS_ERROR_INTERNAL);
+        notify_map_record_chunk(0);
         break;
     }
     case COMMS_SEND_MAP_RECORD_SAVE: {
@@ -1867,6 +1990,11 @@ static void handle_send_command(const comms_packet_view_t *packet)
             memcpy(name, packet->payload, copy_len);
         }
         esp_err_t ret = memory_maps_record_save(name);
+        const esp_err_t control_rate_ret = control_set_mapping_mode(false);
+        const esp_err_t line_rate_ret = line_sensor_set_mapping_mode(false);
+        if (ret == ESP_OK && (control_rate_ret != ESP_OK || line_rate_ret != ESP_OK)) {
+            ret = ESP_ERR_INVALID_STATE;
+        }
         ESP_LOGI(TAG, "SEND map record save name=%s ret=%s", name, esp_err_to_name(ret));
         notify_status(ret == ESP_OK ? COMMS_ERROR_OK : COMMS_ERROR_INTERNAL);
         break;
@@ -1990,6 +2118,19 @@ static void handle_send_command(const comms_packet_view_t *packet)
         notify_status(ret == ESP_OK ? COMMS_ERROR_OK : COMMS_ERROR_INTERNAL);
         break;
     }
+    case COMMS_SEND_LINE_SET_FILTER: {
+        uint8_t filter_percent = LINE_SENSOR_FILTER_PERCENT_DEFAULT;
+        if (packet->payload_len >= sizeof(filter_percent)) {
+            filter_percent = packet->payload[0];
+        }
+        esp_err_t ret = line_sensor_set_filter_percent(filter_percent);
+        ESP_LOGI(TAG,
+                 "SEND line filter=%u%% ret=%s",
+                 (unsigned int)filter_percent,
+                 esp_err_to_name(ret));
+        notify_status(ret == ESP_OK ? COMMS_ERROR_OK : COMMS_ERROR_INTERNAL);
+        break;
+    }
     case COMMS_SEND_RGB_LED_SET_ENABLED: {
         uint8_t enabled = 1;
         if (packet->payload_len >= sizeof(enabled)) {
@@ -2103,6 +2244,61 @@ static void handle_send_command(const comms_packet_view_t *packet)
         notify_status(ret == ESP_OK ? COMMS_ERROR_OK : COMMS_ERROR_INTERNAL);
         break;
     }
+    case COMMS_SEND_SAFETY_SET_DISTANCE_LIMIT_ENABLED: {
+        uint8_t enabled = 0;
+        esp_err_t ret = ESP_ERR_INVALID_SIZE;
+        if (packet->payload_len >= sizeof(enabled)) {
+            enabled = packet->payload[0];
+            ret = safety_set_distance_limit_enabled(enabled != 0);
+        }
+        ESP_LOGI(TAG, "SEND safety distance enabled=%u ret=%s", (unsigned int)enabled, esp_err_to_name(ret));
+        notify_status(ret == ESP_OK ? COMMS_ERROR_OK : COMMS_ERROR_INTERNAL);
+        break;
+    }
+    case COMMS_SEND_SAFETY_SET_DISTANCE_LIMIT: {
+        float distance_m = 1.0f;
+        esp_err_t ret = ESP_ERR_INVALID_SIZE;
+        if (packet->payload_len >= sizeof(distance_m)) {
+            memcpy(&distance_m, packet->payload, sizeof(distance_m));
+            ret = safety_set_distance_limit_m(distance_m);
+        }
+        ESP_LOGI(TAG, "SEND safety distance limit=%.3fm ret=%s", distance_m, esp_err_to_name(ret));
+        notify_status(ret == ESP_OK ? COMMS_ERROR_OK : COMMS_ERROR_INTERNAL);
+        break;
+    }
+    case COMMS_SEND_SAFETY_RESET_DISTANCE: {
+        const esp_err_t ret = safety_reset_distance();
+        ESP_LOGI(TAG, "SEND safety distance reset ret=%s", esp_err_to_name(ret));
+        notify_status(ret == ESP_OK ? COMMS_ERROR_OK : COMMS_ERROR_INTERNAL);
+        break;
+    }
+    case COMMS_SEND_PORTAL_SET_CONFIG: {
+        comms_portal_config_payload_t payload = {0};
+        esp_err_t ret = ESP_ERR_INVALID_SIZE;
+        if (packet->payload_len == sizeof(payload)) {
+            memcpy(&payload, packet->payload, sizeof(payload));
+            ret = portal_sensor_set_config(payload.enabled != 0, payload.threshold_mm, payload.stop_speed_percent, payload.stop_delay_ms);
+        }
+        notify_status(ret == ESP_OK ? COMMS_ERROR_OK : COMMS_ERROR_INTERNAL);
+        break;
+    }
+    case COMMS_SEND_TELEMETRY_SET_ENABLED: {
+        comms_telemetry_enable_payload_t payload = {0};
+        if (packet->payload_len != sizeof(payload)) {
+            notify_status(COMMS_ERROR_INVALID_PACKET);
+            break;
+        }
+        memcpy(&payload, packet->payload, sizeof(payload));
+        if (!configurable_telemetry_id(payload.message_id)) {
+            notify_status(COMMS_ERROR_UNSUPPORTED);
+            break;
+        }
+        atomic_store_explicit(&telemetry_packet_enabled[payload.message_id],
+                              payload.enabled != 0,
+                              memory_order_relaxed);
+        notify_status(COMMS_ERROR_OK);
+        break;
+    }
     default:
         ESP_LOGI(TAG,
                  "SEND id=0x%02x payload_len=%u sem handler",
@@ -2134,8 +2330,6 @@ static int handle_command_write(const uint8_t *data, uint16_t len)
         return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
     }
 
-    pause_regular_telemetry(300);
-
     ++command_write_count;
     ESP_LOGI(TAG,
              "BLE command #%lu class=%s(0x%02x) id=0x%02x payload=%u total_len=%u",
@@ -2164,6 +2358,63 @@ static int handle_command_write(const uint8_t *data, uint16_t len)
     }
 
     return 0;
+}
+
+static void handle_serial_text_command(uint8_t *data, uint16_t len);
+
+static int enqueue_command(const uint8_t *data, uint16_t len, bool serial)
+{
+    comms_ble_command_item_t item = { .len = len, .serial = serial,
+        .generation = atomic_load(&connection_generation), .received_us = esp_timer_get_time() };
+    if (len > sizeof(item.data) || command_queue == NULL) return BLE_ATT_ERR_INSUFFICIENT_RES;
+    memcpy(item.data, data, len);
+    bool stop = false;
+    if (!serial) {
+        comms_packet_view_t packet;
+        if (!is_authenticated) return BLE_ATT_ERR_INSUFFICIENT_AUTHEN;
+        if (!parse_packet(data, len, &packet)) return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+        if (packet.command_class < COMMS_CMD_CLASS_SAVE || packet.command_class > COMMS_CMD_CLASS_TELE)
+            return BLE_ATT_ERR_VALUE_NOT_ALLOWED;
+        stop = packet.command_class == COMMS_CMD_CLASS_SEND && packet.payload_len == 0 &&
+            (packet.message_id == COMMS_SEND_STOP || packet.message_id == COMMS_SEND_CONTROL_STOP ||
+             packet.message_id == COMMS_SEND_MAP_RECORD_STOP);
+    } else {
+        char normalized[81] = {0};
+        if (len >= sizeof(normalized)) return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+        for (uint16_t i = 0; i < len; ++i) normalized[i] = (char)toupper((unsigned char)data[i]);
+        char *start = normalized;
+        while (isspace((unsigned char)*start)) ++start;
+        char *end = start + strlen(start);
+        while (end > start && isspace((unsigned char)end[-1])) *--end = 0;
+        stop = strcmp(start, "STOP") == 0 || strcmp(start, "0") == 0 ||
+               strcmp(start, "OFF") == 0 || strcmp(start, "PARAR") == 0 || strcmp(start, "DESLIGAR") == 0;
+    }
+    /* One consumer serializes execution. STOP discards queued work and runs next,
+       after an already executing operation completes (no concurrent START/STOP). */
+    if (stop) xQueueReset(command_queue);
+    return xQueueSend(command_queue, &item, 0) == pdPASS ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
+}
+
+static void command_task(void *arg)
+{
+    (void)arg;
+    comms_ble_command_item_t item;
+    while (true) {
+        if (xQueueReceive(command_queue, &item, portMAX_DELAY) != pdTRUE) continue;
+        if (!has_active_connection || item.generation != atomic_load(&connection_generation)) continue;
+        const int64_t started_us = esp_timer_get_time();
+        if (item.serial) handle_serial_text_command(item.data, item.len);
+        else (void)handle_command_write(item.data, item.len);
+        if (item.generation != atomic_load(&connection_generation) || !has_active_connection) {
+            /* A disconnect may interrupt a slow START/storage handler. */
+            control_emergency_stop();
+        }
+        const int64_t elapsed_us = esp_timer_get_time() - started_us;
+        if (elapsed_us > 50000 || started_us - item.received_us > 50000) {
+            ESP_LOGW(TAG, "BLE command latency queue=%lldus execution=%lldus",
+                     (long long)(started_us - item.received_us), (long long)elapsed_us);
+        }
+    }
 }
 
 static int auth_access_cb(uint16_t conn_handle,
@@ -2205,7 +2456,7 @@ static int command_access_cb(uint16_t conn_handle,
                              struct ble_gatt_access_ctxt *ctxt,
                              void *arg)
 {
-    uint8_t data[COMMS_MAX_PAYLOAD_LEN] = {0};
+    uint8_t data[4 + COMMS_MAX_PAYLOAD_LEN] = {0};
     uint16_t len = 0;
     int rc = 0;
 
@@ -2222,7 +2473,7 @@ static int command_access_cb(uint16_t conn_handle,
         return rc;
     }
 
-    return handle_command_write(data, len);
+    return enqueue_command(data, len, false);
 }
 
 static int telemetry_access_cb(uint16_t conn_handle,
@@ -2259,6 +2510,159 @@ static int telemetry_access_cb(uint16_t conn_handle,
                : BLE_ATT_ERR_INSUFFICIENT_RES;
 }
 
+static void serial_notify_text(const char *text)
+{
+    if (!has_active_connection || !serial_subscribed || text == NULL) return;
+
+    char response[96] = {0};
+    const int written = snprintf(response, sizeof(response), "%s\r\n", text);
+    if (written <= 0) return;
+    const uint16_t len = (uint16_t)(written < (int)sizeof(response) ? written : (int)sizeof(response) - 1);
+    struct os_mbuf *om = ble_hs_mbuf_from_flat(response, len);
+    if (om != NULL) {
+        const int rc = ble_gatts_notify_custom(active_conn_handle, serial_tx_value_handle, om);
+        if (rc != 0) ESP_LOGW(TAG, "Serial BLE resposta falhou rc=%d", rc);
+    }
+}
+
+static esp_err_t serial_start_previous_or_default(void)
+{
+    control_navigation_state_t previous = {0};
+    if (!control_get_navigation_state(&previous)) return ESP_ERR_INVALID_STATE;
+    if (previous.running) return ESP_OK;
+
+    const int8_t speed = previous.speed_percent != 0 ? previous.speed_percent : 25;
+    if (previous.point_count == 0) return control_start_line(speed);
+    switch (previous.mode) {
+    case CONTROL_NAV_MODE_LINE:
+        return control_start_line(speed);
+    case CONTROL_NAV_MODE_AUTO_TRACK:
+        return control_start_auto_track(previous.map_slot, speed, false);
+    case CONTROL_NAV_MODE_ODOMETRY:
+    default:
+        return control_start_map(previous.map_slot, speed);
+    }
+}
+
+static void handle_serial_text_command(uint8_t *data, uint16_t len)
+{
+    char command[80] = {0};
+    if (len == 0 || len >= sizeof(command)) {
+        serial_notify_text("ERR COMMAND");
+        return;
+    }
+    memcpy(command, data, len);
+    command[len] = '\0';
+
+    char *start = command;
+    while (*start != '\0' && isspace((unsigned char)*start)) ++start;
+    char *end = start + strlen(start);
+    while (end > start && isspace((unsigned char)end[-1])) --end;
+    *end = '\0';
+    for (char *cursor = start; *cursor != '\0'; ++cursor) {
+        *cursor = (char)toupper((unsigned char)*cursor);
+    }
+
+    esp_err_t result = ESP_ERR_INVALID_ARG;
+    int slot = 0;
+    int speed = 25;
+    if (strcmp(start, "STOP") == 0 || strcmp(start, "PARAR") == 0 ||
+        strcmp(start, "0") == 0 || strcmp(start, "OFF") == 0 ||
+        strcmp(start, "DESLIGAR") == 0) {
+        result = control_stop_navigation();
+        serial_notify_text(result == ESP_OK ? "OK STOP" : "ERR STOP");
+    } else if (strcmp(start, "START") == 0 || strcmp(start, "INICIAR") == 0 ||
+               strcmp(start, "1") == 0 || strcmp(start, "ON") == 0 ||
+               strcmp(start, "LIGAR") == 0 || strcmp(start, "GO") == 0) {
+        result = serial_start_previous_or_default();
+        serial_notify_text(result == ESP_OK ? "OK START" : "ERR START");
+    } else if (sscanf(start, "START %d", &speed) == 1 ||
+               sscanf(start, "INICIAR %d", &speed) == 1) {
+        result = (speed >= -100 && speed <= 100 && speed != 0)
+                     ? control_start_line((int8_t)speed)
+                     : ESP_ERR_INVALID_ARG;
+        serial_notify_text(result == ESP_OK ? "OK START LINE" : "ERR SPEED -100..100");
+    } else if (sscanf(start, "START LINE %d", &speed) == 1 ||
+               sscanf(start, "INICIAR LINHA %d", &speed) == 1) {
+        result = (speed >= -100 && speed <= 100 && speed != 0)
+                     ? control_start_line((int8_t)speed)
+                     : ESP_ERR_INVALID_ARG;
+        serial_notify_text(result == ESP_OK ? "OK START LINE" : "ERR START LINE");
+    } else if (sscanf(start, "START AUTO %d %d", &slot, &speed) == 2) {
+        result = (slot >= 0 && slot <= UINT8_MAX && speed >= -100 && speed <= 100 && speed != 0)
+                     ? control_start_auto_track((uint8_t)slot, (int8_t)speed, false)
+                     : ESP_ERR_INVALID_ARG;
+        serial_notify_text(result == ESP_OK ? "OK START AUTO" : "ERR START AUTO");
+    } else if (sscanf(start, "START PLAN %d %d", &slot, &speed) == 2) {
+        result = (slot >= 0 && slot <= UINT8_MAX && speed >= -100 && speed <= 100 && speed != 0)
+                     ? control_start_auto_track((uint8_t)slot, (int8_t)speed, true)
+                     : ESP_ERR_INVALID_ARG;
+        serial_notify_text(result == ESP_OK ? "OK START PLAN" : "ERR START PLAN");
+    } else if (sscanf(start, "START MAP %d %d", &slot, &speed) == 2) {
+        result = (slot >= 0 && slot <= UINT8_MAX && speed >= -100 && speed <= 100 && speed != 0)
+                     ? control_start_map((uint8_t)slot, (int8_t)speed)
+                     : ESP_ERR_INVALID_ARG;
+        serial_notify_text(result == ESP_OK ? "OK START MAP" : "ERR START MAP");
+    } else if (strcmp(start, "STATUS") == 0) {
+        control_navigation_state_t state_now = {0};
+        if (control_get_navigation_state(&state_now)) {
+            char response[80] = {0};
+            snprintf(response,
+                     sizeof(response),
+                     "STATUS %s MODE=%u MAP=%u SPEED=%d",
+                     state_now.running ? "RUNNING" : "STOPPED",
+                     (unsigned)state_now.mode,
+                     (unsigned)state_now.map_slot,
+                     (int)state_now.speed_percent);
+            serial_notify_text(response);
+            result = ESP_OK;
+        } else {
+            serial_notify_text("ERR STATUS");
+        }
+    } else if (strcmp(start, "HELP") == 0 || strcmp(start, "AJUDA") == 0) {
+        serial_notify_text("START/1/ON | STOP/0/OFF | STATUS");
+        serial_notify_text("START velocidade | START LINE velocidade");
+        result = ESP_OK;
+    } else {
+        serial_notify_text("ERR USE HELP");
+    }
+
+    ++command_write_count;
+    ESP_LOGI(TAG,
+             "Serial BLE command #%lu '%s' ret=%s",
+             (unsigned long)command_write_count,
+             start,
+             esp_err_to_name(result));
+}
+
+static int serial_rx_access_cb(uint16_t conn_handle,
+                               uint16_t attr_handle,
+                               struct ble_gatt_access_ctxt *ctxt,
+                               void *arg)
+{
+    uint8_t data[80] = {0};
+    uint16_t len = 0;
+    (void)conn_handle;
+    (void)attr_handle;
+    (void)arg;
+    if (ctxt->op != BLE_GATT_ACCESS_OP_WRITE_CHR) return BLE_ATT_ERR_WRITE_NOT_PERMITTED;
+    const int rc = copy_mbuf_payload(ctxt->om, data, sizeof(data) - 1, &len);
+    if (rc != 0) return rc;
+    return enqueue_command(data, len, true);
+}
+
+static int serial_tx_access_cb(uint16_t conn_handle,
+                               uint16_t attr_handle,
+                               struct ble_gatt_access_ctxt *ctxt,
+                               void *arg)
+{
+    (void)conn_handle;
+    (void)attr_handle;
+    (void)ctxt;
+    (void)arg;
+    return BLE_ATT_ERR_READ_NOT_PERMITTED;
+}
+
 static const struct ble_gatt_svc_def gatt_services[] = {
     {
         .type = BLE_GATT_SVC_TYPE_PRIMARY,
@@ -2283,6 +2687,24 @@ static const struct ble_gatt_svc_def gatt_services[] = {
             {0},
         },
     },
+    {
+        .type = BLE_GATT_SVC_TYPE_PRIMARY,
+        .uuid = &serial_service_uuid.u,
+        .characteristics = (struct ble_gatt_chr_def[]) {
+            {
+                .uuid = &serial_rx_uuid.u,
+                .access_cb = serial_rx_access_cb,
+                .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_NO_RSP,
+            },
+            {
+                .uuid = &serial_tx_uuid.u,
+                .access_cb = serial_tx_access_cb,
+                .val_handle = &serial_tx_value_handle,
+                .flags = BLE_GATT_CHR_F_NOTIFY,
+            },
+            {0},
+        },
+    },
     {0},
 };
 
@@ -2294,7 +2716,9 @@ static void start_advertising(void)
     int rc = 0;
 
     fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
-    fields.uuids128 = &service_uuid;
+    /* Anuncie NUS para o Serial Bluetooth Terminal detectar o perfil UART.
+       A UI de engenharia continua encontrando o robo pelo nome. */
+    fields.uuids128 = &serial_service_uuid;
     fields.num_uuids128 = 1;
     fields.uuids128_is_complete = 1;
     fields.tx_pwr_lvl_is_present = 1;
@@ -2331,13 +2755,14 @@ static int comms_gap_event(struct ble_gap_event *event, void *arg)
 {
     (void)arg;
 
-    ESP_LOGI(TAG, "BLE GAP event=%s(%d)", gap_event_name(event->type), event->type);
+    ESP_LOGD(TAG, "BLE GAP event=%s(%d)", gap_event_name(event->type), event->type);
 
     switch (event->type) {
     case BLE_GAP_EVENT_CONNECT:
         has_active_connection = event->connect.status == 0;
         is_authenticated = false;
         telemetry_subscribed = false;
+        serial_subscribed = false;
         if (has_active_connection) {
             active_conn_handle = event->connect.conn_handle;
             active_att_mtu = ble_att_mtu(active_conn_handle);
@@ -2378,6 +2803,8 @@ static int comms_gap_event(struct ble_gap_event *event, void *arg)
         return 0;
 
     case BLE_GAP_EVENT_DISCONNECT:
+        atomic_fetch_add(&connection_generation, 1);
+        if (command_queue != NULL) xQueueReset(command_queue);
         ESP_LOGW(TAG,
                  "BLE desconectado reason=%d conn_handle=%u ok=%lu fail=%lu commands=%lu pending_map=%d received=%u/%u",
                  event->disconnect.reason,
@@ -2393,6 +2820,7 @@ static int comms_gap_event(struct ble_gap_event *event, void *arg)
         active_att_mtu = COMMS_BLE_DEFAULT_ATT_MTU;
         is_authenticated = false;
         telemetry_subscribed = false;
+        serial_subscribed = false;
         auth_deadline_us = 0;
         notify_in_flight = false;
         telemetry_tx_backoff_until_us = 0;
@@ -2416,6 +2844,13 @@ static int comms_gap_event(struct ble_gap_event *event, void *arg)
                      event->subscribe.prev_notify,
                      event->subscribe.cur_notify,
                      event->subscribe.reason);
+        } else if (event->subscribe.attr_handle == serial_tx_value_handle) {
+            serial_subscribed = event->subscribe.cur_notify != 0;
+            ESP_LOGI(TAG,
+                     "Notify serial BLE %s attr=%u",
+                     serial_subscribed ? "on" : "off",
+                     (unsigned int)event->subscribe.attr_handle);
+            if (serial_subscribed) serial_notify_text("READY ASPIRADOR");
         }
         return 0;
 
@@ -2502,7 +2937,8 @@ static void host_task(void *param)
 esp_err_t comms_ble_init(void)
 {
     esp_log_level_set("NimBLE", ESP_LOG_WARN);
-    esp_log_level_set(TAG, ESP_LOG_INFO);
+    esp_log_level_set(TAG, ESP_LOG_WARN);
+    reset_telemetry_packet_config();
 
     int rc = nimble_port_init();
 
@@ -2537,7 +2973,13 @@ esp_err_t comms_ble_init(void)
     }
 
     ble_store_config_init();
-    nimble_port_freertos_init(host_task);
+    if (command_queue == NULL) {
+        command_queue = xQueueCreate(COMMS_BLE_COMMAND_QUEUE_DEPTH, sizeof(comms_ble_command_item_t));
+        if (command_queue == NULL) return ESP_ERR_NO_MEM;
+    }
+    if (command_task_handle == NULL && xTaskCreatePinnedToCore(command_task, "ble_commands", 6144,
+            NULL, COMMS_BLE_COMMAND_TASK_PRIORITY, &command_task_handle, COMMS_BLE_TASK_CORE_ID) != pdPASS)
+        return ESP_ERR_NO_MEM;
 
     if (tx_queue == NULL) {
         tx_queue = xQueueCreate(COMMS_BLE_TX_QUEUE_DEPTH, sizeof(comms_ble_tx_item_t));
@@ -2568,7 +3010,7 @@ esp_err_t comms_ble_init(void)
                                                           NULL,
                                                           COMMS_BLE_TELEMETRY_TASK_PRIORITY,
                                                           &telemetry_task_handle,
-                                                          COMMS_BLE_TASK_CORE_ID);
+                                                          COMMS_BLE_TELEMETRY_TASK_CORE_ID);
         if (task_created != pdPASS) {
             ESP_LOGE(TAG, "Falha ao criar task de telemetria BLE");
             return ESP_FAIL;
@@ -2592,7 +3034,8 @@ esp_err_t comms_ble_init(void)
     if (telemetry_timer_handle == NULL) {
         const esp_timer_create_args_t timer_args = {
             .callback = telemetry_timer_cb,
-            .name = "ble_sensor_30hz",
+            .skip_unhandled_events = true,
+            .name = "ble_sensor_60hz",
         };
         esp_err_t timer_ret = esp_timer_create(&timer_args, &telemetry_timer_handle);
         if (timer_ret != ESP_OK) {
@@ -2607,8 +3050,9 @@ esp_err_t comms_ble_init(void)
         }
     }
 
+    nimble_port_freertos_init(host_task);
     ESP_LOGI(TAG,
-             "BLE pronto device=%s service=%s auth=%s sensor=%.1fHz linha_fast=%.1fHz linha_full=%.1fHz tele=%.1fHz core=%d txq=%d",
+             "BLE pronto device=%s service=%s auth=%s sensor=%.1fHz linha_fast=%.1fHz linha_full=%.1fHz tele=%.1fHz core_tx=%d core_tele=%d txq=%d",
              COMMS_DEVICE_NAME,
              COMMS_SERVICE_UUID_STR,
              COMMS_AUTH_UUID_STR,
@@ -2617,6 +3061,7 @@ esp_err_t comms_ble_init(void)
              1000000.0f / ((float)COMMS_BLE_SENSOR_TELEMETRY_PERIOD_US * (float)COMMS_BLE_FULL_LINE_TELEMETRY_DIVIDER),
              1000000.0f / ((float)COMMS_BLE_SENSOR_TELEMETRY_PERIOD_US * (float)COMMS_BLE_REGULAR_TELEMETRY_DIVIDER),
              COMMS_BLE_TASK_CORE_ID,
+             COMMS_BLE_TELEMETRY_TASK_CORE_ID,
              COMMS_BLE_TX_QUEUE_DEPTH);
 
     return ESP_OK;

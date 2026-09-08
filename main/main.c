@@ -11,11 +11,13 @@
 #include "memory_maps.h"
 #include "motors.h"
 #include "odometry.h"
+#include "portal_sensor.h"
 #include "rgb_led.h"
 #include "safety.h"
 
+#define ROBOT_TASK_CORE_LINE_SENSOR 0
 #define ROBOT_TASK_CORE_CONTROL 1
-#define ROBOT_TASK_CORE_COMMS 0
+#define ROBOT_TASK_CORE_COMMS 1
 
 static const char *TAG = "main";
 
@@ -51,13 +53,15 @@ void app_main(void)
     init_or_warn("led rgb", rgb_led_init());
     init_or_warn("sensor de linha", line_sensor_init());
     init_or_warn("IMU", imu_init());
+    init_or_warn("entrada digital de portal", portal_sensor_init());
     init_or_warn("odometria", odometry_init());
     init_or_warn("seguranca", safety_init());
     init_or_warn("controle", control_init());
     ESP_ERROR_CHECK(comms_ble_init());
 
     ESP_LOGI(TAG,
-             "Robo corretamente iniciado. Nucleos: control=%d comms=%d",
+             "Robo corretamente iniciado. Nucleos: linha=%d control=%d comms=%d",
+             ROBOT_TASK_CORE_LINE_SENSOR,
              ROBOT_TASK_CORE_CONTROL,
              ROBOT_TASK_CORE_COMMS);
 }

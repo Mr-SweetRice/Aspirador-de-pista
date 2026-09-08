@@ -5,6 +5,7 @@ import json
 import subprocess
 import sys
 import threading
+from collections import deque
 from dataclasses import dataclass
 
 from PySide6.QtCore import QObject, Signal
@@ -19,8 +20,10 @@ except ImportError:  # pragma: no cover
 
 SCAN_DISCOVER_TIMEOUT_S = 2.5
 SCAN_PROCESS_TIMEOUT_S = 6.0
-COMMAND_WRITE_SPACING_S = 0.08
-COMMAND_RETRY_BASE_DELAY_S = 0.25
+COMMAND_WRITE_SPACING_S = 0.0  # ATT write-with-response already provides flow control.
+COMMAND_RETRY_BASE_DELAY_S = 0.03
+COMMAND_QUEUE_LIMIT = 128
+COMMAND_WRITE_TIMEOUT_S = 2.0
 
 
 @dataclass
@@ -44,10 +47,12 @@ class BleRobotClient(QObject):
         self._devices: list[BleDevice] = []
         self._write_lock: asyncio.Lock | None = None
         self._last_command_write_at = 0.0
-        self._realtime_packets: dict[int, bytes] = {}
-        self._realtime_task_running = False
         self._notifications_started = False
         self._scan_running = False
+        self._command_queue = deque()
+        self._command_worker = None
+        self._command_epoch = 0
+        self._command_wakeup = None
         self._loop = asyncio.new_event_loop()
         self._thread = threading.Thread(target=self._run_loop, name="ble-asyncio", daemon=True)
         self._thread.start()
@@ -72,10 +77,58 @@ class BleRobotClient(QObject):
         self._submit(self._keepalive(token))
 
     def write_command(self, packet: bytes) -> None:
-        if self._is_realtime_motor_command(packet):
-            self._loop.call_soon_threadsafe(self._queue_realtime_command, packet)
+        self._loop.call_soon_threadsafe(self._enqueue_command, bytes(packet))
+
+    def _clear_commands(self) -> None:
+        self._command_epoch += 1
+        self._command_queue.clear()
+        if self._command_wakeup is not None:
+            self._command_wakeup.set()
+
+    @staticmethod
+    def _is_stop_command(packet: bytes) -> bool:
+        return len(packet) == 4 and packet[:2] == b'\x01\x03' and packet[2] in (0x01, 0x23, 0x41)
+
+    def _enqueue_command(self, packet: bytes) -> None:
+        if not self._client or not self._client.is_connected:
+            self.error.emit("BLE nao conectado")
             return
-        self._submit(self._write_command(packet))
+        if self._is_stop_command(packet):
+            self._clear_commands()
+        elif self._is_realtime_motor_command(packet):
+            # Replace only the trailing PWM group; never reorder across configuration/start.
+            for index in range(len(self._command_queue) - 1, -1, -1):
+                old, epoch, queued_at = self._command_queue[index]
+                if not self._is_realtime_motor_command(old):
+                    break
+                if old[2] == packet[2]:
+                    self._command_queue[index] = (packet, epoch, queued_at)
+                    return
+        if len(self._command_queue) >= COMMAND_QUEUE_LIMIT:
+            self.error.emit("Fila BLE cheia; comando nao enviado")
+            return
+        entry = (packet, self._command_epoch, self._loop.time())
+        if len(packet) >= 4 and packet[1] == 2:
+            if any(old == packet for old, _, _ in self._command_queue):
+                return
+            self._command_queue.append(entry)
+        else:
+            # Keep control/configuration order, but do not wait behind background reads.
+            index = next((i for i, (old, _, _) in enumerate(self._command_queue)
+                          if len(old) >= 4 and old[1] == 2), len(self._command_queue))
+            self._command_queue.insert(index, entry)
+        if self._command_worker is None or self._command_worker.done():
+            self._command_worker = self._loop.create_task(self._drain_commands())
+
+    async def _drain_commands(self) -> None:
+        while self._command_queue:
+            packet, epoch, queued_at = self._command_queue.popleft()
+            started_at = self._loop.time()
+            await self._write_command(packet, epoch)
+            queue_ms = (started_at - queued_at) * 1000
+            att_ms = (self._loop.time() - started_at) * 1000
+            if epoch == self._command_epoch and queue_ms + att_ms > 150:
+                self.status.emit(f"BLE class=0x{packet[1]:02x} id=0x{packet[2]:02x}: fila={queue_ms:.0f} ms, ATT={att_ms:.0f} ms")
 
     def shutdown(self) -> None:
         future = asyncio.run_coroutine_threadsafe(self._disconnect(), self._loop)
@@ -220,6 +273,7 @@ asyncio.run(main())
             )
 
     async def _disconnect(self) -> None:
+        self._clear_commands()
         try:
             if self._client and self._client.is_connected:
                 print("[BLE UI] disconnect requested", flush=True)
@@ -276,7 +330,10 @@ asyncio.run(main())
         finally:
             self._notifications_started = False
 
-    async def _write_command(self, packet: bytes) -> None:
+    async def _write_command(self, packet: bytes, epoch: int | None = None) -> None:
+        if epoch is None:
+            epoch = self._command_epoch
+        client = self._client
         if not self._client or not self._client.is_connected:
             self.error.emit("BLE nao conectado")
             return
@@ -284,58 +341,45 @@ asyncio.run(main())
             self._write_lock = asyncio.Lock()
         try:
             async with self._write_lock:
-                max_attempts = 2 if self._is_realtime_motor_command(packet) else 6
+                max_attempts = 3
                 for attempt in range(1, max_attempts + 1):
-                    if len(packet) >= 4:
-                        print(
-                            f"[BLE UI] command write class=0x{packet[1]:02x} id=0x{packet[2]:02x} payload={packet[3]} total={len(packet)} attempt={attempt}",
-                            flush=True,
-                        )
+                    if epoch != self._command_epoch or client is not self._client:
+                        return
                     try:
                         await self._wait_for_command_slot()
-                        await self._client.write_gatt_char(COMMAND_UUID, packet, response=True)
+                        await asyncio.wait_for(client.write_gatt_char(COMMAND_UUID, packet, response=True), COMMAND_WRITE_TIMEOUT_S)
                         self._last_command_write_at = self._loop.time()
-                        if len(packet) >= 4:
-                            print(f"[BLE UI] command ok id=0x{packet[2]:02x}", flush=True)
+                        return
+                    except asyncio.TimeoutError:
+                        # Execution is ambiguous: never replay a start/reset/save after timeout.
+                        if client is not self._client:
+                            return
+                        self.error.emit("Timeout BLE; desconectando para descartar comandos pendentes")
+                        await self._disconnect()
                         return
                     except Exception as exc:
                         if attempt >= max_attempts or not self._is_insufficient_resource(exc):
                             raise
                         print(f"[BLE UI] command retry after insufficient resource: {exc}", flush=True)
                         self._last_command_write_at = self._loop.time()
-                        await asyncio.sleep(COMMAND_RETRY_BASE_DELAY_S * attempt)
+                        self._command_wakeup = asyncio.Event()
+                        try:
+                            await asyncio.wait_for(self._command_wakeup.wait(), COMMAND_RETRY_BASE_DELAY_S * attempt)
+                        except asyncio.TimeoutError:
+                            pass
         except Exception as exc:
             if len(packet) >= 4:
                 print(f"[BLE UI] command failed id=0x{packet[2]:02x}: {exc}", flush=True)
             else:
                 print(f"[BLE UI] command failed: {exc}", flush=True)
             self.error.emit(f"Falha ao enviar comando: {exc}")
+            if epoch == self._command_epoch:
+                self._clear_commands()  # Do not START with a failed configuration/reset.
 
     async def _wait_for_command_slot(self) -> None:
         elapsed = self._loop.time() - self._last_command_write_at
         if elapsed < COMMAND_WRITE_SPACING_S:
             await asyncio.sleep(COMMAND_WRITE_SPACING_S - elapsed)
-
-    def _queue_realtime_command(self, packet: bytes) -> None:
-        if len(packet) < 4:
-            return
-        self._realtime_packets[packet[2]] = packet
-        if not self._realtime_task_running:
-            self._realtime_task_running = True
-            self._loop.create_task(self._write_realtime_commands())
-
-    async def _write_realtime_commands(self) -> None:
-        try:
-            while self._realtime_packets:
-                pending = list(self._realtime_packets.values())
-                self._realtime_packets.clear()
-                for packet in pending:
-                    await self._write_command(packet)
-        finally:
-            self._realtime_task_running = False
-            if self._realtime_packets:
-                self._realtime_task_running = True
-                self._loop.create_task(self._write_realtime_commands())
 
     @staticmethod
     def _is_realtime_motor_command(packet: bytes) -> bool:
@@ -347,6 +391,9 @@ asyncio.run(main())
         return "insufficient resource" in message or "0x11" in message
 
     def _on_disconnect(self, client: BleakClient) -> None:
+        if client is not self._client:
+            return
+        self._clear_commands()
         self._client = None
         self._notifications_started = False
         self.connected_changed.emit(False)

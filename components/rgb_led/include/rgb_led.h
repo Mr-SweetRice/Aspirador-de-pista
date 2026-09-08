@@ -27,6 +27,12 @@ esp_err_t rgb_led_set_enabled(bool enabled);
 esp_err_t rgb_led_set_mode(rgb_led_mode_t mode);
 esp_err_t rgb_led_set_manual_color(uint8_t red, uint8_t green, uint8_t blue, uint8_t intensity);
 esp_err_t rgb_led_set_race_plan_color(uint8_t red, uint8_t green, uint8_t blue);
+esp_err_t rgb_led_set_battery_mode_runtime(void);
+/* period_ms is one complete on/off cycle; zero selects a solid color. */
+esp_err_t rgb_led_set_race_plan_blink(uint8_t red,
+                                      uint8_t green,
+                                      uint8_t blue,
+                                      uint32_t period_ms);
 bool rgb_led_get_state(rgb_led_state_t *out_state);
 
 #endif

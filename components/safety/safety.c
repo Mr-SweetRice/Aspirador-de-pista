@@ -4,6 +4,7 @@
 #include <string.h>
 
 #include "battery_level.h"
+#include "encoder.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -12,11 +13,14 @@
 #include "line_sensor.h"
 #include "memory_config.h"
 #include "nvs.h"
+#include "odometry_config.h"
 
 #define SAFETY_NVS_KEY_COLLISION_EN "safe_col_en"
 #define SAFETY_NVS_KEY_BATTERY_EN "safe_bat_en"
 #define SAFETY_NVS_KEY_LINE_EN "safe_line_en"
 #define SAFETY_NVS_KEY_BLE_EN "safe_ble_en"
+#define SAFETY_NVS_KEY_DISTANCE_EN "safe_dist_en"
+#define SAFETY_NVS_KEY_DISTANCE_MM "safe_dist_mm"
 #define SAFETY_NVS_KEY_ROLL_MDEG "safe_roll_md"
 #define SAFETY_NVS_KEY_BATT_CENTI "safe_bat_cp"
 #define SAFETY_NVS_KEY_LINE_MS "safe_line_ms"
@@ -24,6 +28,9 @@
 #define SAFETY_DEFAULT_BATTERY_BLOCK_PERCENT 10.0f
 #define SAFETY_BATTERY_PRESENT_MIN_V 6.0f
 #define SAFETY_DEFAULT_LINE_LOSS_TIMEOUT_S 1.0f
+#define SAFETY_DEFAULT_DISTANCE_LIMIT_M 1.0f
+#define SAFETY_MAX_DISTANCE_LIMIT_M 1000.0f
+#define SAFETY_MAX_ENCODER_STEP_M 10.0f
 #define SAFETY_TASK_PERIOD_MS 50
 #define SAFETY_ROLL_FILTER_MS 200
 #define SAFETY_ROLL_FILTER_SAMPLES (SAFETY_ROLL_FILTER_MS / SAFETY_TASK_PERIOD_MS)
@@ -40,6 +47,9 @@ static uint8_t roll_sample_index;
 static uint8_t roll_sample_count;
 static float roll_sample_sum;
 static int64_t line_lost_since_us;
+static int32_t last_distance_left_count;
+static int32_t last_distance_right_count;
+static bool have_distance_counts;
 
 static float clamp_float(float value, float min_value, float max_value)
 {
@@ -50,6 +60,52 @@ static float clamp_float(float value, float min_value, float max_value)
         return max_value;
     }
     return value;
+}
+
+static void update_motors_blocked_locked(void)
+{
+    state.motors_blocked = state.collision_active ||
+                           state.battery_block_active ||
+                           state.line_loss_active ||
+                           state.ble_loss_active ||
+                           state.distance_limit_active;
+}
+
+static void rebase_distance_counts_locked(const encoder_state_t *encoder)
+{
+    if (encoder == NULL) {
+        have_distance_counts = false;
+        return;
+    }
+    last_distance_left_count = encoder->counts[ENCODER_LEFT];
+    last_distance_right_count = encoder->counts[ENCODER_RIGHT];
+    have_distance_counts = true;
+}
+
+static void update_encoder_distance(void)
+{
+    encoder_state_t encoder = {0};
+    if (!encoder_get_state(&encoder)) {
+        return;
+    }
+
+    portENTER_CRITICAL(&state_mux);
+    if (!have_distance_counts) {
+        rebase_distance_counts_locked(&encoder);
+        portEXIT_CRITICAL(&state_mux);
+        return;
+    }
+
+    const int64_t delta_left = (int64_t)encoder.counts[ENCODER_LEFT] - (int64_t)last_distance_left_count;
+    const int64_t delta_right = (int64_t)encoder.counts[ENCODER_RIGHT] - (int64_t)last_distance_right_count;
+    rebase_distance_counts_locked(&encoder);
+    const float meters_per_count = ODOMETRY_WHEEL_CIRCUMFERENCE_M /
+                                   ODOMETRY_ENCODER_COUNTS_PER_WHEEL_REV;
+    const float increment_m = 0.5f * (fabsf((float)delta_left) + fabsf((float)delta_right)) * meters_per_count;
+    if (isfinite(increment_m) && increment_m >= 0.0f && increment_m <= SAFETY_MAX_ENCODER_STEP_M) {
+        state.distance_traveled_m += increment_m;
+    }
+    portEXIT_CRITICAL(&state_mux);
 }
 
 static esp_err_t save_settings_to_nvs(void)
@@ -78,6 +134,9 @@ static esp_err_t save_settings_to_nvs(void)
         ret = nvs_set_u8(handle, SAFETY_NVS_KEY_BLE_EN, local.ble_loss_enabled ? 1 : 0);
     }
     if (ret == ESP_OK) {
+        ret = nvs_set_u8(handle, SAFETY_NVS_KEY_DISTANCE_EN, local.distance_limit_enabled ? 1 : 0);
+    }
+    if (ret == ESP_OK) {
         ret = nvs_set_i32(handle, SAFETY_NVS_KEY_ROLL_MDEG, (int32_t)lroundf(local.roll_limit_deg * 1000.0f));
     }
     if (ret == ESP_OK) {
@@ -85,6 +144,9 @@ static esp_err_t save_settings_to_nvs(void)
     }
     if (ret == ESP_OK) {
         ret = nvs_set_i32(handle, SAFETY_NVS_KEY_LINE_MS, (int32_t)lroundf(local.line_loss_timeout_s * 1000.0f));
+    }
+    if (ret == ESP_OK) {
+        ret = nvs_set_i32(handle, SAFETY_NVS_KEY_DISTANCE_MM, (int32_t)lroundf(local.distance_limit_m * 1000.0f));
     }
     if (ret == ESP_OK) {
         ret = nvs_commit(handle);
@@ -117,6 +179,10 @@ static void load_settings_from_nvs(void)
     if (nvs_get_u8(handle, SAFETY_NVS_KEY_BLE_EN, &enabled) == ESP_OK) {
         state.ble_loss_enabled = enabled != 0;
     }
+    enabled = 0;
+    if (nvs_get_u8(handle, SAFETY_NVS_KEY_DISTANCE_EN, &enabled) == ESP_OK) {
+        state.distance_limit_enabled = enabled != 0;
+    }
     int32_t stored = 0;
     if (nvs_get_i32(handle, SAFETY_NVS_KEY_ROLL_MDEG, &stored) == ESP_OK) {
         state.roll_limit_deg = clamp_float((float)stored / 1000.0f, 1.0f, 90.0f);
@@ -126,6 +192,9 @@ static void load_settings_from_nvs(void)
     }
     if (nvs_get_i32(handle, SAFETY_NVS_KEY_LINE_MS, &stored) == ESP_OK) {
         state.line_loss_timeout_s = clamp_float((float)stored / 1000.0f, 0.1f, 10.0f);
+    }
+    if (nvs_get_i32(handle, SAFETY_NVS_KEY_DISTANCE_MM, &stored) == ESP_OK) {
+        state.distance_limit_m = clamp_float((float)stored / 1000.0f, 0.01f, SAFETY_MAX_DISTANCE_LIMIT_M);
     }
 
     nvs_close(handle);
@@ -158,6 +227,7 @@ static void safety_task(void *arg)
         const bool has_battery_sample = battery_level_get_state(&battery) && battery.valid;
         const bool has_battery = has_battery_sample && battery.voltage_v >= SAFETY_BATTERY_PRESENT_MIN_V;
         const bool has_line = line_sensor_get_state(&line) && line.calibrated_valid;
+        update_encoder_distance();
         const int64_t now_us = esp_timer_get_time();
         const float filtered_roll = has_imu ? update_roll_average(imu.roll_deg) : state.current_roll_deg;
         float line_loss_elapsed_s = 0.0f;
@@ -193,10 +263,9 @@ static void safety_task(void *arg)
                                      state.current_battery_percent <= state.battery_block_percent;
         state.line_loss_active = state.line_loss_enabled && line_loss_active;
         state.ble_loss_active = state.ble_loss_enabled && !state.ble_connected;
-        state.motors_blocked = state.collision_active ||
-                               state.battery_block_active ||
-                               state.line_loss_active ||
-                               state.ble_loss_active;
+        state.distance_limit_active = state.distance_limit_enabled &&
+                                      state.distance_traveled_m >= state.distance_limit_m;
+        update_motors_blocked_locked();
         portEXIT_CRITICAL(&state_mux);
 
         vTaskDelay(pdMS_TO_TICKS(SAFETY_TASK_PERIOD_MS));
@@ -214,10 +283,12 @@ esp_err_t safety_init(void)
     state.battery_block_enabled = true;
     state.line_loss_enabled = true;
     state.ble_loss_enabled = true;
+    state.distance_limit_enabled = false;
     state.ble_connected = false;
     state.roll_limit_deg = SAFETY_DEFAULT_ROLL_LIMIT_DEG;
     state.battery_block_percent = SAFETY_DEFAULT_BATTERY_BLOCK_PERCENT;
     state.line_loss_timeout_s = SAFETY_DEFAULT_LINE_LOSS_TIMEOUT_S;
+    state.distance_limit_m = SAFETY_DEFAULT_DISTANCE_LIMIT_M;
     load_settings_from_nvs();
     state.ble_loss_active = state.ble_loss_enabled && !state.ble_connected;
     state.motors_blocked = state.ble_loss_active;
@@ -235,11 +306,13 @@ esp_err_t safety_init(void)
 
     initialized = true;
     ESP_LOGI(TAG,
-             "Seguranca iniciada roll=%.1fdeg bateria=%.1f%% linha=%.1fs ble=%d",
+             "Seguranca iniciada roll=%.1fdeg bateria=%.1f%% linha=%.1fs ble=%d distancia=%d/%.2fm",
              state.roll_limit_deg,
              state.battery_block_percent,
              state.line_loss_timeout_s,
-             state.ble_loss_enabled ? 1 : 0);
+             state.ble_loss_enabled ? 1 : 0,
+             state.distance_limit_enabled ? 1 : 0,
+             state.distance_limit_m);
     return ESP_OK;
 }
 
@@ -318,10 +391,27 @@ esp_err_t safety_set_ble_loss_enabled(bool enabled)
     if (!enabled) {
         state.ble_loss_active = false;
     }
-    state.motors_blocked = state.collision_active ||
-                           state.battery_block_active ||
-                           state.line_loss_active ||
-                           state.ble_loss_active;
+    update_motors_blocked_locked();
+    portEXIT_CRITICAL(&state_mux);
+    return save_settings_to_nvs();
+}
+
+esp_err_t safety_set_distance_limit_enabled(bool enabled)
+{
+    if (!initialized) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    encoder_state_t encoder = {0};
+    const bool has_encoder = encoder_get_state(&encoder);
+    portENTER_CRITICAL(&state_mux);
+    if (enabled && !state.distance_limit_enabled) {
+        state.distance_traveled_m = 0.0f;
+        rebase_distance_counts_locked(has_encoder ? &encoder : NULL);
+    }
+    state.distance_limit_enabled = enabled;
+    state.distance_limit_active = enabled && state.distance_traveled_m >= state.distance_limit_m;
+    update_motors_blocked_locked();
     portEXIT_CRITICAL(&state_mux);
     return save_settings_to_nvs();
 }
@@ -335,10 +425,7 @@ esp_err_t safety_set_ble_connected(bool connected)
     portENTER_CRITICAL(&state_mux);
     state.ble_connected = connected;
     state.ble_loss_active = state.ble_loss_enabled && !state.ble_connected;
-    state.motors_blocked = state.collision_active ||
-                           state.battery_block_active ||
-                           state.line_loss_active ||
-                           state.ble_loss_active;
+    update_motors_blocked_locked();
     portEXIT_CRITICAL(&state_mux);
     return ESP_OK;
 }
@@ -376,4 +463,36 @@ esp_err_t safety_set_battery_block_percent(float percent)
     state.battery_block_percent = clamp_float(percent, 0.0f, 100.0f);
     portEXIT_CRITICAL(&state_mux);
     return save_settings_to_nvs();
+}
+
+esp_err_t safety_set_distance_limit_m(float distance_m)
+{
+    if (!initialized || !isfinite(distance_m)) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    portENTER_CRITICAL(&state_mux);
+    state.distance_limit_m = clamp_float(distance_m, 0.01f, SAFETY_MAX_DISTANCE_LIMIT_M);
+    state.distance_limit_active = state.distance_limit_enabled &&
+                                  state.distance_traveled_m >= state.distance_limit_m;
+    update_motors_blocked_locked();
+    portEXIT_CRITICAL(&state_mux);
+    return save_settings_to_nvs();
+}
+
+esp_err_t safety_reset_distance(void)
+{
+    if (!initialized) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    encoder_state_t encoder = {0};
+    const bool has_encoder = encoder_get_state(&encoder);
+    portENTER_CRITICAL(&state_mux);
+    state.distance_traveled_m = 0.0f;
+    state.distance_limit_active = false;
+    rebase_distance_counts_locked(has_encoder ? &encoder : NULL);
+    update_motors_blocked_locked();
+    portEXIT_CRITICAL(&state_mux);
+    return ESP_OK;
 }

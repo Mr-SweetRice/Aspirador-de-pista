@@ -27,12 +27,15 @@
 #define CONTROL_NVS_KEY_KP_MILLI "ctrl_kp"
 #define CONTROL_NVS_KEY_KI_MILLI "ctrl_ki"
 #define CONTROL_NVS_KEY_KD_MILLI "ctrl_kd"
+#define CONTROL_NVS_KEY_LINE_ALPHA_MILLI "ctrl_lalpha"
 #define CONTROL_NVS_KEY_LIMIT "ctrl_lim"
 #define CONTROL_NVS_KEY_AUX "ctrl_aux"
 #define CONTROL_NVS_KEY_SPEED_PROFILE "ctrl_spd_prof"
 #define CONTROL_NVS_KEY_SPEED_PROFILE_ENABLED "ctrl_spd_en"
 #define CONTROL_NVS_KEY_BATTERY_COMPENSATION "ctrl_bat_comp"
 #define CONTROL_NVS_KEY_AUTO_TRACK_CONFIG "ctrl_auto_cfg"
+#define CONTROL_NVS_KEY_RACE_PLAN "ctrl_raceplan"
+#define CONTROL_RACE_PLAN_NVS_VERSION 1U
 #define CONTROL_AUTO_TRACK_CONFIG_LEGACY_LINE_LOSS_OFFSET (sizeof(uint8_t) + sizeof(uint8_t) + sizeof(float))
 #define CONTROL_AUTO_TRACK_CONFIG_LEGACY_SIZE \
     (CONTROL_AUTO_TRACK_CONFIG_LEGACY_LINE_LOSS_OFFSET + sizeof(uint8_t))
@@ -75,6 +78,8 @@
 
 static const char *TAG = "control";
 static const float CONTROL_PI_F = 3.14159265f;
+static bool portal_stop_active;
+static uint8_t portal_stop_speed_percent;
 
 static TaskHandle_t control_task_handle;
 static TaskHandle_t race_plan_task_handle;
@@ -90,21 +95,28 @@ static control_race_plan_segment_t race_plan_segments[CONTROL_RACE_PLAN_MAX_SEGM
 static uint8_t race_plan_segment_count;
 static bool race_plan_enabled;
 static bool race_plan_runtime_enabled;
+static bool race_plan_prestart_active;
+static bool race_plan_navigation_enabled;
 static int8_t race_plan_direction = 1;
 static int64_t race_plan_start_us;
+static int64_t race_plan_prestart_end_us;
 static float race_plan_track_distance_m;
+static uint8_t race_plan_prestart_aux_percent;
 static memory_map_point_t active_map[MEMORY_MAP_MAX_POINTS];
 static float active_map_distance_m[MEMORY_MAP_MAX_POINTS];
-static int32_t map_start_left_count;
-static int32_t map_start_right_count;
-static bool map_encoder_reference_valid;
+static uint16_t map_last_segment_index = 1;
+static float map_last_progress_m;
+static bool map_pose_reference_valid;
 static float manual_kp;
 static float manual_ki;
 static float manual_kd;
+static float line_alpha;
 static float error_integral_rad_s;
 static float previous_error_rad;
 static bool have_previous_error;
 static bool initialized;
+static bool mapping_rate_enabled;
+static uint32_t control_task_period_us = CONTROL_TASK_PERIOD_US;
 static float speed_avg_samples[CONTROL_SPEED_AVG_WINDOW_MS];
 static uint16_t speed_avg_index;
 static uint16_t speed_avg_count;
@@ -112,10 +124,12 @@ static float speed_avg_sum;
 static float speed_max_mps;
 
 static float wrap_pi(float angle);
+static float clamp_float(float value, float min_value, float max_value);
 static void race_plan_task(void *arg);
 static void track_odometry_task(void *arg);
 
 typedef struct {
+    uint16_t segment_index;
     uint16_t target_index;
     float target_x_m;
     float target_y_m;
@@ -126,6 +140,13 @@ typedef struct {
     float progress_m;
     bool complete;
 } control_map_progress_t;
+
+typedef struct __attribute__((packed)) {
+    uint32_t version;
+    uint8_t enabled;
+    uint8_t count;
+    control_race_plan_segment_t segments[CONTROL_RACE_PLAN_MAX_SEGMENTS];
+} control_race_plan_nvs_t;
 
 static int32_t gain_to_milli(float value)
 {
@@ -207,6 +228,38 @@ static bool race_plan_is_valid(const control_race_plan_segment_t *segments, size
     return true;
 }
 
+static bool race_plan_matches_active_map(uint16_t point_count)
+{
+    if (point_count < 2) {
+        return false;
+    }
+
+    bool valid = false;
+    portENTER_CRITICAL(&state_mux);
+    if (race_plan_enabled && race_plan_segment_count > 0) {
+        valid = true;
+        uint16_t expected_start = 1;
+        for (uint8_t i = 0; i < race_plan_segment_count; ++i) {
+            const control_race_plan_segment_t segment = race_plan_segments[i];
+            if (segment.start_index != expected_start || segment.end_index >= point_count) {
+                valid = false;
+                break;
+            }
+            expected_start = (uint16_t)(segment.end_index + 1U);
+        }
+        if (expected_start != point_count) {
+            valid = false;
+        }
+    }
+    portEXIT_CRITICAL(&state_mux);
+    return valid;
+}
+
+static bool line_alpha_is_valid(float alpha)
+{
+    return isfinite(alpha) && alpha >= 0.0f && alpha <= 1.0f;
+}
+
 static uint8_t abs_speed_percent(int8_t speed_percent)
 {
     int speed = abs((int)speed_percent);
@@ -219,12 +272,6 @@ static uint8_t abs_speed_percent(int8_t speed_percent)
 static int signed_speed_percent(int8_t requested_speed, uint8_t magnitude)
 {
     return requested_speed < 0 ? -(int)magnitude : (int)magnitude;
-}
-
-static float encoder_counts_to_meters(int32_t counts)
-{
-    return ((float)counts * ODOMETRY_WHEEL_CIRCUMFERENCE_M) /
-           ODOMETRY_ENCODER_COUNTS_PER_WHEEL_REV;
 }
 
 static void build_active_map_distances(uint16_t total_points)
@@ -242,47 +289,7 @@ static void build_active_map_distances(uint16_t total_points)
     }
 }
 
-static void reset_map_encoder_reference(void)
-{
-    encoder_state_t encoder = {0};
-    if (encoder_get_state(&encoder)) {
-        map_start_left_count = encoder.counts[ENCODER_LEFT];
-        map_start_right_count = encoder.counts[ENCODER_RIGHT];
-        map_encoder_reference_valid = true;
-    } else {
-        map_start_left_count = 0;
-        map_start_right_count = 0;
-        map_encoder_reference_valid = false;
-    }
-}
-
-static float map_encoder_progress_m(int8_t speed_percent)
-{
-    if (!map_encoder_reference_valid) {
-        reset_map_encoder_reference();
-        if (!map_encoder_reference_valid) {
-            return 0.0f;
-        }
-    }
-
-    encoder_state_t encoder = {0};
-    if (!encoder_get_state(&encoder)) {
-        return 0.0f;
-    }
-
-    float left_m = encoder_counts_to_meters(encoder.counts[ENCODER_LEFT] - map_start_left_count);
-    float right_m = encoder_counts_to_meters(encoder.counts[ENCODER_RIGHT] - map_start_right_count);
-    float progress_m = (left_m + right_m) * 0.5f;
-    if (speed_percent < 0) {
-        progress_m = -progress_m;
-    }
-    if (progress_m < 0.0f) {
-        progress_m = 0.0f;
-    }
-    return progress_m;
-}
-
-static bool map_progress_from_encoder(const control_navigation_state_t *local, control_map_progress_t *out_progress)
+static bool map_progress_from_odometry(const control_navigation_state_t *local, control_map_progress_t *out_progress)
 {
     if (local == NULL || out_progress == NULL || local->point_count < 2) {
         return false;
@@ -294,49 +301,93 @@ static bool map_progress_from_encoder(const control_navigation_state_t *local, c
         return false;
     }
 
-    float progress_m = map_encoder_progress_m(local->speed_percent);
-    if (progress_m > total_distance_m) {
-        progress_m = total_distance_m;
+    odometry_state_t pose = {0};
+    if (!odometry_get_state(&pose) ||
+        !isfinite(pose.fused_x_m) || !isfinite(pose.fused_y_m) ||
+        !isfinite(pose.fused_heading_rad)) {
+        return false;
     }
 
-    uint16_t target_index = 1;
+    float progress_m = 0.0f;
+    float closest_distance_sq = INFINITY;
+    uint16_t closest_segment_end = 1;
+    uint16_t search_start = 1;
+    uint16_t search_end = last_index;
+    if (map_pose_reference_valid) {
+        search_start = map_last_segment_index > CONTROL_MAP_SEARCH_BACK_SEGMENTS ?
+                           (uint16_t)(map_last_segment_index - CONTROL_MAP_SEARCH_BACK_SEGMENTS) :
+                           1;
+        const uint32_t candidate_end = (uint32_t)map_last_segment_index +
+                                       CONTROL_MAP_SEARCH_AHEAD_SEGMENTS;
+        search_end = candidate_end < last_index ? (uint16_t)candidate_end : last_index;
+    }
+
+    for (uint16_t end_index = search_start; end_index <= search_end; ++end_index) {
+        const memory_map_point_t start = active_map[end_index - 1];
+        const memory_map_point_t end = active_map[end_index];
+        const float segment_x = end.x_m - start.x_m;
+        const float segment_y = end.y_m - start.y_m;
+        const float segment_length_sq = (segment_x * segment_x) + (segment_y * segment_y);
+        if (segment_length_sq <= 0.00000001f) {
+            continue;
+        }
+
+        float t = (((pose.fused_x_m - start.x_m) * segment_x) +
+                   ((pose.fused_y_m - start.y_m) * segment_y)) /
+                  segment_length_sq;
+        t = clamp_float(t, 0.0f, 1.0f);
+        const float projected_x = start.x_m + (segment_x * t);
+        const float projected_y = start.y_m + (segment_y * t);
+        const float error_x = pose.fused_x_m - projected_x;
+        const float error_y = pose.fused_y_m - projected_y;
+        const float distance_sq = (error_x * error_x) + (error_y * error_y);
+        float expected_heading = atan2f(segment_y, segment_x);
+        if (local->speed_percent < 0) {
+            expected_heading = wrap_pi(expected_heading + CONTROL_PI_F);
+        }
+        const float heading_error = fabsf(wrap_pi(pose.fused_heading_rad - expected_heading));
+        const float heading_cost_m = heading_error * CONTROL_MAP_HEADING_SCORE_WEIGHT_M_PER_RAD;
+        const float pose_score = distance_sq + (heading_cost_m * heading_cost_m);
+        if (pose_score < closest_distance_sq) {
+            closest_distance_sq = pose_score;
+            closest_segment_end = end_index;
+            progress_m = active_map_distance_m[end_index - 1] +
+                         (sqrtf(segment_length_sq) * t);
+        }
+    }
+
+    if (map_pose_reference_valid &&
+        progress_m + CONTROL_MAP_PROGRESS_BACKTRACK_TOLERANCE_M < map_last_progress_m) {
+        closest_segment_end = map_last_segment_index;
+        progress_m = map_last_progress_m;
+    } else {
+        map_last_segment_index = closest_segment_end;
+        map_last_progress_m = progress_m;
+        map_pose_reference_valid = true;
+    }
+
+    uint16_t target_index = closest_segment_end;
     while (target_index < last_index &&
            active_map_distance_m[target_index] <= progress_m + CONTROL_TARGET_REACHED_DISTANCE_M) {
         ++target_index;
     }
+    const float target_dx = active_map[target_index].x_m - pose.fused_x_m;
+    const float target_dy = active_map[target_index].y_m - pose.fused_y_m;
+    const float final_dx = active_map[last_index].x_m - pose.fused_x_m;
+    const float final_dy = active_map[last_index].y_m - pose.fused_y_m;
 
-    uint16_t segment_end_index = 1;
-    while (segment_end_index < last_index && active_map_distance_m[segment_end_index] < progress_m) {
-        ++segment_end_index;
-    }
-    const uint16_t segment_start_index = segment_end_index > 0 ? (uint16_t)(segment_end_index - 1) : 0;
-    const float start_distance = active_map_distance_m[segment_start_index];
-    const float end_distance = active_map_distance_m[segment_end_index];
-    const float segment_distance = end_distance - start_distance;
-    float t = segment_distance > 0.0001f ? (progress_m - start_distance) / segment_distance : 0.0f;
-    if (t < 0.0f) {
-        t = 0.0f;
-    } else if (t > 1.0f) {
-        t = 1.0f;
-    }
-
-    const memory_map_point_t start = active_map[segment_start_index];
-    const memory_map_point_t end = active_map[segment_end_index];
-    const float dx = end.x_m - start.x_m;
-    const float dy = end.y_m - start.y_m;
-
+    out_progress->segment_index = closest_segment_end;
     out_progress->target_index = target_index;
     out_progress->target_x_m = active_map[target_index].x_m;
     out_progress->target_y_m = active_map[target_index].y_m;
-    out_progress->map_x_m = start.x_m + (dx * t);
-    out_progress->map_y_m = start.y_m + (dy * t);
-    out_progress->map_heading_rad = atan2f(dy, dx);
-    out_progress->distance_to_target_m = active_map_distance_m[target_index] - progress_m;
-    if (out_progress->distance_to_target_m < 0.0f) {
-        out_progress->distance_to_target_m = 0.0f;
-    }
+    out_progress->map_x_m = pose.fused_x_m;
+    out_progress->map_y_m = pose.fused_y_m;
+    out_progress->map_heading_rad = pose.fused_heading_rad;
+    out_progress->distance_to_target_m = sqrtf((target_dx * target_dx) + (target_dy * target_dy));
     out_progress->progress_m = progress_m;
-    out_progress->complete = progress_m >= total_distance_m;
+    out_progress->complete = progress_m >= total_distance_m - CONTROL_TARGET_REACHED_DISTANCE_M &&
+                             sqrtf((final_dx * final_dx) + (final_dy * final_dy)) <=
+                                 CONTROL_TARGET_REACHED_DISTANCE_M;
     return true;
 }
 
@@ -371,6 +422,9 @@ static esp_err_t load_active_map(uint8_t map_slot, uint16_t *out_total_points)
 
     *out_total_points = total_points;
     build_active_map_distances(total_points);
+    map_last_segment_index = 1;
+    map_last_progress_m = 0.0f;
+    map_pose_reference_valid = true;
     return ESP_OK;
 }
 
@@ -388,14 +442,14 @@ static void race_plan_led_color(control_race_segment_type_t type, uint8_t *red, 
 {
     switch (type) {
     case CONTROL_RACE_SEGMENT_INTERSECTION:
-        *red = 86;
-        *green = 204;
-        *blue = 242;
+        *red = 27;
+        *green = 15;
+        *blue = 255;
         break;
     case CONTROL_RACE_SEGMENT_CURVE:
-        *red = 242;
-        *green = 153;
-        *blue = 74;
+        *red = 255;
+        *green = 54;
+        *blue = 0;
         break;
     case CONTROL_RACE_SEGMENT_STOP:
         *red = 235;
@@ -404,15 +458,19 @@ static void race_plan_led_color(control_race_segment_type_t type, uint8_t *red, 
         break;
     case CONTROL_RACE_SEGMENT_NORMAL:
     default:
-        *red = 39;
-        *green = 174;
-        *blue = 96;
+        *red = 70;
+        *green = 255;
+        *blue = 0;
         break;
     }
 }
 
 static void update_race_plan_led(control_race_segment_type_t type)
 {
+    if (type == CONTROL_RACE_SEGMENT_STOP) {
+        rgb_led_set_battery_mode_runtime();
+        return;
+    }
     uint8_t red = 0;
     uint8_t green = 0;
     uint8_t blue = 0;
@@ -452,98 +510,18 @@ static bool race_plan_segment_for_target(uint16_t target_index, control_race_pla
     return race_plan_segment_for_target_index(target_index, out_segment, NULL);
 }
 
-static bool race_plan_segment_is_drive_profile(const control_race_plan_segment_t *segment)
+static uint8_t race_plan_straight_aux_percent(void)
 {
-    return segment != NULL &&
-           segment->type != CONTROL_RACE_SEGMENT_STOP &&
-           segment->type != CONTROL_RACE_SEGMENT_INTERSECTION;
-}
-
-static bool race_plan_neighbor_profile(uint8_t segment_index, int direction, control_race_plan_segment_t *out_segment)
-{
-    if (out_segment == NULL || direction == 0) {
-        return false;
-    }
-
-    bool found = false;
+    uint8_t aux_percent = 0;
     portENTER_CRITICAL(&state_mux);
-    int index = (int)segment_index + direction;
-    while (index >= 0 && index < (int)race_plan_segment_count) {
-        const control_race_plan_segment_t candidate = race_plan_segments[index];
-        if (race_plan_segment_is_drive_profile(&candidate)) {
-            *out_segment = candidate;
-            found = true;
+    for (uint8_t i = 0; i < race_plan_segment_count; ++i) {
+        if (race_plan_segments[i].type == CONTROL_RACE_SEGMENT_NORMAL) {
+            aux_percent = race_plan_segments[i].aux_percent;
             break;
         }
-        index += direction;
     }
     portEXIT_CRITICAL(&state_mux);
-    return found;
-}
-
-static uint8_t lerp_u8(uint8_t from, uint8_t to, float t)
-{
-    const float value = (float)from + (((float)to - (float)from) * t);
-    if (value <= 0.0f) {
-        return 0;
-    }
-    if (value >= 100.0f) {
-        return 100;
-    }
-    return (uint8_t)lroundf(value);
-}
-
-static float lerp_float(float from, float to, float t)
-{
-    return from + ((to - from) * t);
-}
-
-static control_race_plan_segment_t race_plan_effective_segment(const control_race_plan_segment_t *segment,
-                                                               uint8_t segment_index,
-                                                               float progress_m)
-{
-    if (segment == NULL) {
-        return (control_race_plan_segment_t){0};
-    }
-    control_race_plan_segment_t effective = *segment;
-    if (segment->type != CONTROL_RACE_SEGMENT_INTERSECTION ||
-        segment->end_index >= MEMORY_MAP_MAX_POINTS) {
-        return effective;
-    }
-
-    control_race_plan_segment_t previous = *segment;
-    control_race_plan_segment_t next = *segment;
-    const bool has_previous = race_plan_neighbor_profile(segment_index, -1, &previous);
-    const bool has_next = race_plan_neighbor_profile(segment_index, 1, &next);
-    if (!has_previous && !has_next) {
-        return effective;
-    }
-    if (!has_previous) {
-        previous = next;
-    }
-    if (!has_next) {
-        next = previous;
-    }
-
-    const uint16_t start_index = segment->start_index > 0 ? (uint16_t)(segment->start_index - 1U) : 0;
-    const uint16_t end_index = segment->end_index;
-    const float start_m = active_map_distance_m[start_index];
-    const float end_m = active_map_distance_m[end_index];
-    const float span_m = end_m - start_m;
-    float t = span_m > 0.0001f ? (progress_m - start_m) / span_m : 0.0f;
-    if (t < 0.0f) {
-        t = 0.0f;
-    } else if (t > 1.0f) {
-        t = 1.0f;
-    }
-
-    effective.speed_percent = lerp_u8(previous.speed_percent, next.speed_percent, t);
-    effective.max_speed_percent = lerp_u8(previous.max_speed_percent, next.max_speed_percent, t);
-    effective.aux_percent = lerp_u8(previous.aux_percent, next.aux_percent, t);
-    effective.kp = lerp_float(previous.kp, next.kp, t);
-    effective.ki = lerp_float(previous.ki, next.ki, t);
-    effective.kd = lerp_float(previous.kd, next.kd, t);
-    return effective;
+    return aux_percent;
 }
 
 static control_drive_selection_t select_drive_for_target(const control_navigation_state_t *local,
@@ -652,6 +630,13 @@ static void load_settings_from_nvs(void)
         manual_kd = milli_to_gain(stored);
         nav_state.kd = manual_kd;
     }
+    if (nvs_get_i32(handle, CONTROL_NVS_KEY_LINE_ALPHA_MILLI, &stored) == ESP_OK && stored >= 0) {
+        const float stored_alpha = milli_to_gain(stored);
+        if (line_alpha_is_valid(stored_alpha)) {
+            line_alpha = stored_alpha;
+            nav_state.line_alpha = line_alpha;
+        }
+    }
     if (nvs_get_u8(handle, CONTROL_NVS_KEY_LIMIT, &limit) == ESP_OK && limit <= 100) {
         nav_state.motor_limit_percent = limit;
     }
@@ -717,6 +702,21 @@ static esp_err_t save_settings_to_nvs(float kp, float ki, float kd, uint8_t limi
     return ret;
 }
 
+static esp_err_t save_line_alpha_to_nvs(float alpha)
+{
+    nvs_handle_t handle;
+    esp_err_t ret = nvs_open(MEMORY_NVS_NAMESPACE, NVS_READWRITE, &handle);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+    ret = nvs_set_i32(handle, CONTROL_NVS_KEY_LINE_ALPHA_MILLI, gain_to_milli(alpha));
+    if (ret == ESP_OK) {
+        ret = nvs_commit(handle);
+    }
+    nvs_close(handle);
+    return ret;
+}
+
 static esp_err_t save_speed_profile_enabled_to_nvs(bool enabled)
 {
     nvs_handle_t handle;
@@ -760,6 +760,55 @@ static esp_err_t save_auto_track_config_to_nvs(void)
     }
     nvs_close(handle);
     return ret;
+}
+
+static esp_err_t save_race_plan_to_nvs(void)
+{
+    control_race_plan_nvs_t persisted = {
+        .version = CONTROL_RACE_PLAN_NVS_VERSION,
+    };
+    portENTER_CRITICAL(&state_mux);
+    persisted.enabled = race_plan_enabled ? 1U : 0U;
+    persisted.count = race_plan_segment_count;
+    memcpy(persisted.segments, race_plan_segments, sizeof(race_plan_segments));
+    portEXIT_CRITICAL(&state_mux);
+
+    nvs_handle_t handle;
+    esp_err_t ret = nvs_open(MEMORY_NVS_NAMESPACE, NVS_READWRITE, &handle);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+    ret = nvs_set_blob(handle, CONTROL_NVS_KEY_RACE_PLAN, &persisted, sizeof(persisted));
+    if (ret == ESP_OK) {
+        ret = nvs_commit(handle);
+    }
+    nvs_close(handle);
+    return ret;
+}
+
+static void load_race_plan_from_nvs(void)
+{
+    nvs_handle_t handle;
+    esp_err_t ret = nvs_open(MEMORY_NVS_NAMESPACE, NVS_READONLY, &handle);
+    if (ret != ESP_OK) {
+        return;
+    }
+
+    control_race_plan_nvs_t persisted = {0};
+    size_t length = sizeof(persisted);
+    ret = nvs_get_blob(handle, CONTROL_NVS_KEY_RACE_PLAN, &persisted, &length);
+    nvs_close(handle);
+    if (ret != ESP_OK || length != sizeof(persisted) ||
+        persisted.version != CONTROL_RACE_PLAN_NVS_VERSION ||
+        !persisted.enabled || persisted.count == 0 ||
+        !race_plan_is_valid(persisted.segments, persisted.count)) {
+        return;
+    }
+
+    memcpy(race_plan_segments, persisted.segments, sizeof(race_plan_segments));
+    race_plan_segment_count = persisted.count;
+    race_plan_enabled = true;
+    ESP_LOGI(TAG, "Plano de corrida carregado da NVS segmentos=%u", (unsigned int)race_plan_segment_count);
 }
 
 static float wrap_pi(float angle)
@@ -812,6 +861,76 @@ static int compensate_motor_percent(uint8_t percent, bool battery_compensation_e
     return clamp_motor_percent((float)percent, percent, battery_compensation_enabled);
 }
 
+static float clamp_float(float value, float min_value, float max_value)
+{
+    if (value < min_value) {
+        return min_value;
+    }
+    if (value > max_value) {
+        return max_value;
+    }
+    return value;
+}
+
+static float motor_limit_scaled(uint8_t limit_percent, bool battery_compensation_enabled)
+{
+    float limit = (float)limit_percent * battery_voltage_scale(battery_compensation_enabled);
+    if (limit > 100.0f) {
+        limit = 100.0f;
+    }
+    if (limit < 0.0f) {
+        limit = 0.0f;
+    }
+    return limit;
+}
+
+static void redistribute_steering_overflow(float *left, float *right, float min_value, float max_value)
+{
+    if (*left < min_value) {
+        const float overflow = min_value - *left;
+        *left = min_value;
+        *right += overflow;
+    }
+    if (*right < min_value) {
+        const float overflow = min_value - *right;
+        *right = min_value;
+        *left += overflow;
+    }
+    if (*left > max_value) {
+        const float overflow = *left - max_value;
+        *left = max_value;
+        *right -= overflow;
+    }
+    if (*right > max_value) {
+        const float overflow = *right - max_value;
+        *right = max_value;
+        *left -= overflow;
+    }
+
+    *left = clamp_float(*left, min_value, max_value);
+    *right = clamp_float(*right, min_value, max_value);
+}
+
+static void mix_steering_commands(int base_percent,
+                                  float steer_percent,
+                                  uint8_t limit_percent,
+                                  bool battery_compensation_enabled,
+                                  int *left_out,
+                                  int *right_out)
+{
+    const float voltage_scale = battery_voltage_scale(battery_compensation_enabled);
+    const float limit = motor_limit_scaled(limit_percent, battery_compensation_enabled);
+    float left = ((float)base_percent - steer_percent) * voltage_scale;
+    float right = ((float)base_percent + steer_percent) * voltage_scale;
+    const float min_value = base_percent < 0 ? -limit : 0.0f;
+    const float max_value = base_percent < 0 ? 0.0f : limit;
+
+    redistribute_steering_overflow(&left, &right, min_value, max_value);
+
+    *left_out = (int)lroundf(left);
+    *right_out = (int)lroundf(right);
+}
+
 static float clamp_abs(float value, float limit)
 {
     if (value > limit) {
@@ -821,6 +940,13 @@ static float clamp_abs(float value, float limit)
         return -limit;
     }
     return value;
+}
+
+static float line_proportional_correction(float error, float kp, float alpha)
+{
+    const float x = clamp_float(error / CONTROL_LINE_ERROR_MAX, -1.0f, 1.0f);
+    const float shaped_error = ((1.0f - alpha) * x) + (alpha * x * fabsf(x));
+    return kp * shaped_error;
 }
 
 static void update_error_integral(float error, float dt_s)
@@ -855,12 +981,13 @@ static void update_speed_stats(float linear_mps)
         speed_avg_sum += speed_mps;
     }
     speed_avg_index = (uint16_t)((speed_avg_index + 1U) % CONTROL_SPEED_AVG_WINDOW_MS);
-    if (speed_mps > speed_max_mps) {
-        speed_max_mps = speed_mps;
+    const float average_speed_mps = speed_avg_count > 0 ? speed_avg_sum / (float)speed_avg_count : 0.0f;
+    if (average_speed_mps > speed_max_mps) {
+        speed_max_mps = average_speed_mps;
     }
 
     portENTER_CRITICAL(&state_mux);
-    nav_state.average_speed_mps = speed_avg_count > 0 ? speed_avg_sum / (float)speed_avg_count : 0.0f;
+    nav_state.average_speed_mps = average_speed_mps;
     nav_state.max_speed_mps = speed_max_mps;
     portEXIT_CRITICAL(&state_mux);
 }
@@ -895,10 +1022,16 @@ static float set_navigation_stopped_with_aux(uint8_t active_aux_percent)
 {
     const int64_t stop_us = esp_timer_get_time();
     float race_plan_average_mps = 0.0f;
+    bool race_was_active = false;
     portENTER_CRITICAL(&state_mux);
+    race_was_active = race_plan_runtime_enabled || race_plan_prestart_active;
     const float loop_hz = nav_state.loop_hz;
     race_plan_average_mps = finish_race_plan_average_locked(stop_us);
     race_plan_runtime_enabled = false;
+    race_plan_prestart_active = false;
+    race_plan_navigation_enabled = false;
+    race_plan_prestart_end_us = 0;
+    race_plan_prestart_aux_percent = 0;
     nav_state.running = false;
     nav_state.distance_m = 0.0f;
     nav_state.angle_error_rad = 0.0f;
@@ -913,12 +1046,15 @@ static float set_navigation_stopped_with_aux(uint8_t active_aux_percent)
     previous_error_rad = 0.0f;
     have_previous_error = false;
     portEXIT_CRITICAL(&state_mux);
+    if (race_was_active) {
+        rgb_led_set_battery_mode_runtime();
+    }
     return race_plan_average_mps;
 }
 
-static void apply_race_plan_stop(uint16_t target_index, uint8_t map_slot)
+static void apply_race_plan_stop(uint16_t target_index, uint8_t map_slot, uint8_t aux_percent)
 {
-    const uint8_t stop_aux_percent = 100;
+    const uint8_t stop_aux_percent = aux_percent <= 100 ? aux_percent : 100;
     motors_set_percent(MOTORS_MOTOR_AUX, stop_aux_percent);
     motors_brake_drive();
     const float average_mps = set_navigation_stopped_with_aux(stop_aux_percent);
@@ -968,7 +1104,7 @@ static void race_plan_task(void *arg)
         }
 
         control_map_progress_t progress = {0};
-        if (!map_progress_from_encoder(&local, &progress)) {
+        if (!map_progress_from_odometry(&local, &progress)) {
             continue;
         }
 
@@ -984,17 +1120,14 @@ static void race_plan_task(void *arg)
         }
 
         control_race_plan_segment_t segment = {0};
-        uint8_t segment_index = 0;
-        const bool has_segment = race_plan_segment_for_target_index(progress.target_index, &segment, &segment_index);
+        const bool has_segment = race_plan_segment_for_target_index(progress.segment_index, &segment, NULL);
         if (has_segment && segment.type == CONTROL_RACE_SEGMENT_STOP) {
             update_race_plan_led(CONTROL_RACE_SEGMENT_STOP);
-            apply_race_plan_stop(progress.target_index, local.map_slot);
+            apply_race_plan_stop(progress.segment_index, local.map_slot, segment.aux_percent);
             continue;
         }
         const control_race_plan_segment_t effective_segment = has_segment ?
-                                                                  race_plan_effective_segment(&segment,
-                                                                                              segment_index,
-                                                                                              progress.progress_m) :
+                                                                  segment :
                                                                   (control_race_plan_segment_t){0};
 
         if (has_segment && (!have_led_type || last_led_type != segment.type)) {
@@ -1084,7 +1217,12 @@ static void track_odometry_task(void *arg)
         }
         encoder_sample_now();
         odometry_update_from_sensors();
-        memory_maps_record_update();
+        const esp_err_t record_ret = memory_maps_record_update();
+        if (record_ret == ESP_ERR_NO_MEM) {
+            (void)control_set_mapping_mode(false);
+            (void)line_sensor_set_mapping_mode(false);
+            ESP_LOGW(TAG, "Frequencias normais restauradas apos limite da gravacao");
+        }
     }
 }
 
@@ -1102,7 +1240,7 @@ static void control_task(void *arg)
         const int64_t now_us = esp_timer_get_time();
         int64_t dt_us = now_us - last_loop_us;
         if (dt_us <= 0) {
-            dt_us = CONTROL_TASK_PERIOD_US;
+            dt_us = control_task_period_us;
         }
         last_loop_us = now_us;
 
@@ -1122,14 +1260,28 @@ static void control_task(void *arg)
         float local_manual_kp = 0.0f;
         float local_manual_ki = 0.0f;
         float local_manual_kd = 0.0f;
+        float local_line_alpha = CONTROL_LINE_PROPORTIONAL_ALPHA_DEFAULT;
         bool local_race_plan_runtime_enabled = false;
+        bool local_race_plan_navigation_enabled = false;
+        bool local_race_plan_prestart_active = false;
+        bool local_portal_stop_active = false;
+        uint8_t local_portal_stop_speed_percent = 0;
+        int64_t local_race_plan_prestart_end_us = 0;
+        uint8_t local_race_plan_prestart_aux_percent = 0;
         portENTER_CRITICAL(&state_mux);
         local = nav_state;
         local_auto_config = auto_track_config;
         local_manual_kp = manual_kp;
         local_manual_ki = manual_ki;
         local_manual_kd = manual_kd;
+        local_line_alpha = line_alpha;
         local_race_plan_runtime_enabled = race_plan_runtime_enabled;
+        local_race_plan_navigation_enabled = race_plan_navigation_enabled;
+        local_race_plan_prestart_active = race_plan_prestart_active;
+        local_race_plan_prestart_end_us = race_plan_prestart_end_us;
+        local_race_plan_prestart_aux_percent = race_plan_prestart_aux_percent;
+        local_portal_stop_active = portal_stop_active;
+        local_portal_stop_speed_percent = portal_stop_speed_percent;
         portEXIT_CRITICAL(&state_mux);
 
         if (!local.running) {
@@ -1137,10 +1289,55 @@ static void control_task(void *arg)
             continue;
         }
         if (!safety_motors_allowed()) {
-            motors_stop_all_immediate();
+            motors_brake_drive();
             last_aux_percent = 0;
             set_navigation_stopped();
             ESP_LOGW(TAG, "Controle parado: bloqueio de seguranca ativo");
+            continue;
+        }
+
+        if (local_race_plan_prestart_active) {
+            if (last_aux_percent != (int)local_race_plan_prestart_aux_percent) {
+                motors_set_percent(MOTORS_MOTOR_AUX, local_race_plan_prestart_aux_percent);
+                last_aux_percent = local_race_plan_prestart_aux_percent;
+            }
+
+            control_map_progress_t prestart_progress = {0};
+            const bool progress_valid = map_progress_from_odometry(&local, &prestart_progress);
+            portENTER_CRITICAL(&state_mux);
+            nav_state.active_speed_percent = 0;
+            nav_state.active_aux_percent = local_race_plan_prestart_aux_percent;
+            nav_state.steer_percent = 0.0f;
+            nav_state.angle_error_rad = 0.0f;
+            if (progress_valid) {
+                nav_state.target_index = prestart_progress.target_index;
+                nav_state.target_x_m = prestart_progress.target_x_m;
+                nav_state.target_y_m = prestart_progress.target_y_m;
+                nav_state.map_x_m = prestart_progress.map_x_m;
+                nav_state.map_y_m = prestart_progress.map_y_m;
+                nav_state.map_heading_rad = prestart_progress.map_heading_rad;
+                nav_state.distance_m = prestart_progress.distance_to_target_m;
+            }
+            if (now_us >= local_race_plan_prestart_end_us && race_plan_prestart_active) {
+                race_plan_prestart_active = false;
+                race_plan_prestart_end_us = 0;
+                race_plan_runtime_enabled = true;
+                race_plan_start_us = now_us;
+            }
+            portEXIT_CRITICAL(&state_mux);
+
+            if (now_us >= local_race_plan_prestart_end_us) {
+                control_race_plan_segment_t first_segment = {0};
+                if (progress_valid &&
+                    race_plan_segment_for_target_index(prestart_progress.segment_index, &first_segment, NULL)) {
+                    update_race_plan_led((control_race_segment_type_t)first_segment.type);
+                } else {
+                    update_race_plan_led(CONTROL_RACE_SEGMENT_NORMAL);
+                }
+                ESP_LOGI(TAG,
+                         "Pre-partida concluida: controle do plano liberado, turbina=%u%%",
+                         (unsigned int)local_race_plan_prestart_aux_percent);
+            }
             continue;
         }
 
@@ -1188,7 +1385,7 @@ static void control_task(void *arg)
                 control_map_progress_t map_progress = {0};
                 const bool map_progress_valid = auto_track_mode &&
                                                 !race_plan_runtime_mode &&
-                                                map_progress_from_encoder(&local, &map_progress);
+                                                map_progress_from_odometry(&local, &map_progress);
                 if (map_progress_valid) {
                     local.target_index = map_progress.target_index;
                     map_target.x_m = map_progress.target_x_m;
@@ -1199,7 +1396,7 @@ static void control_task(void *arg)
                         last_aux_percent = 0;
                         set_navigation_stopped();
                         ESP_LOGI(TAG,
-                                 "Ponto final alcancado por encoder em auto pista slot=%u dist=%.3fm",
+                                 "Ponto final alcancado por odometria completa em auto pista slot=%u dist=%.3fm",
                                  (unsigned int)local.map_slot,
                                  map_progress.progress_m);
                         continue;
@@ -1219,13 +1416,15 @@ static void control_task(void *arg)
                                                                         local_manual_ki,
                                                                         local_manual_kd) :
                                                       select_drive_for_target(&local,
-                                                                              true,
+                                                                              local_race_plan_navigation_enabled,
                                                                               local.target_index,
                                                                               local_manual_kp,
                                                                               local_manual_ki,
                                                                               local_manual_kd);
                 if (drive.stop) {
-                    apply_race_plan_stop(local.target_index, local.map_slot);
+                    apply_race_plan_stop(local.target_index,
+                                         local.map_slot,
+                                         drive.race_segment_active ? drive.race_segment.aux_percent : 0);
                     last_aux_percent = 100;
                     continue;
                 }
@@ -1242,16 +1441,23 @@ static void control_task(void *arg)
                                              0.0f;
                 previous_error_rad = error;
                 have_previous_error = true;
-                const float steer = clamp_abs((drive.profile.kp * error) +
+                const float steer = clamp_abs(line_proportional_correction(error,
+                                                                           drive.profile.kp,
+                                                                           local_line_alpha) +
                                                   (drive.profile.ki * error_integral_rad_s) +
                                                   (drive.profile.kd * derivative),
                                               CONTROL_MAX_STEER_PERCENT);
-                const int left = clamp_motor_percent((float)drive.drive_speed_percent - steer,
-                                                     drive.motor_limit_percent,
-                                                     local.battery_compensation_enabled);
-                const int right = clamp_motor_percent((float)drive.drive_speed_percent + steer,
-                                                      drive.motor_limit_percent,
-                                                      local.battery_compensation_enabled);
+                int left = 0;
+                int right = 0;
+                const int portal_drive_speed = local_portal_stop_active ?
+                                               signed_speed_percent(local.speed_percent, local_portal_stop_speed_percent) :
+                                               drive.drive_speed_percent;
+                mix_steering_commands(portal_drive_speed,
+                                      steer,
+                                      drive.motor_limit_percent,
+                                      local.battery_compensation_enabled,
+                                      &left,
+                                      &right);
 
                 motors_set_percent(MOTORS_MOTOR_LEFT, left);
                 motors_set_percent(MOTORS_MOTOR_RIGHT, right);
@@ -1288,7 +1494,8 @@ static void control_task(void *arg)
                 nav_state.kp = drive.profile.kp;
                 nav_state.ki = drive.profile.ki;
                 nav_state.kd = drive.profile.kd;
-                nav_state.active_speed_percent = drive.selected_speed_percent;
+                nav_state.line_alpha = local_line_alpha;
+                nav_state.active_speed_percent = local_portal_stop_active ? local_portal_stop_speed_percent : drive.selected_speed_percent;
                 if (!race_plan_runtime_mode) {
                     update_active_race_segment_locked(auto_track_mode ? &drive : NULL);
                 }
@@ -1336,13 +1543,15 @@ static void control_task(void *arg)
         }
 
         control_drive_selection_t drive = select_drive_for_target(&local,
-                                                                  true,
+                                                                  local_race_plan_navigation_enabled,
                                                                   local.target_index,
                                                                   local_manual_kp,
                                                                   local_manual_ki,
                                                                   local_manual_kd);
         if (drive.stop) {
-            apply_race_plan_stop(local.target_index, local.map_slot);
+            apply_race_plan_stop(local.target_index,
+                                 local.map_slot,
+                                 drive.race_segment_active ? drive.race_segment.aux_percent : 0);
             last_aux_percent = 100;
             continue;
         }
@@ -1365,12 +1574,17 @@ static void control_task(void *arg)
                                           (drive.profile.ki * error_integral_rad_s) +
                                           (drive.profile.kd * derivative),
                                       CONTROL_MAX_STEER_PERCENT);
-        const int left = clamp_motor_percent((float)drive.drive_speed_percent - steer,
-                                             drive.motor_limit_percent,
-                                             local.battery_compensation_enabled);
-        const int right = clamp_motor_percent((float)drive.drive_speed_percent + steer,
-                                              drive.motor_limit_percent,
-                                              local.battery_compensation_enabled);
+        int left = 0;
+        int right = 0;
+        const int portal_drive_speed = local_portal_stop_active ?
+                                       signed_speed_percent(local.speed_percent, local_portal_stop_speed_percent) :
+                                       drive.drive_speed_percent;
+        mix_steering_commands(portal_drive_speed,
+                              steer,
+                              drive.motor_limit_percent,
+                              local.battery_compensation_enabled,
+                              &left,
+                              &right);
 
         motors_set_percent(MOTORS_MOTOR_LEFT, left);
         motors_set_percent(MOTORS_MOTOR_RIGHT, right);
@@ -1385,7 +1599,7 @@ static void control_task(void *arg)
         nav_state.kp = drive.profile.kp;
         nav_state.ki = drive.profile.ki;
         nav_state.kd = drive.profile.kd;
-        nav_state.active_speed_percent = drive.selected_speed_percent;
+        nav_state.active_speed_percent = local_portal_stop_active ? local_portal_stop_speed_percent : drive.selected_speed_percent;
         update_active_race_segment_locked(&drive);
         nav_state.active_aux_percent = (uint8_t)active_aux_percent;
         portEXIT_CRITICAL(&state_mux);
@@ -1406,9 +1620,11 @@ esp_err_t control_init(void)
     manual_kp = CONTROL_HEADING_KP_PERCENT_PER_RAD;
     manual_ki = CONTROL_HEADING_KI_PERCENT_PER_RAD_S;
     manual_kd = CONTROL_HEADING_KD_PERCENT_S_PER_RAD;
+    line_alpha = CONTROL_LINE_PROPORTIONAL_ALPHA_DEFAULT;
     nav_state.kp = manual_kp;
     nav_state.ki = manual_ki;
     nav_state.kd = manual_kd;
+    nav_state.line_alpha = line_alpha;
     nav_state.motor_limit_percent = CONTROL_DEFAULT_MOTOR_LIMIT_PERCENT;
     nav_state.active_speed_percent = 0;
     nav_state.aux_percent = 0;
@@ -1424,6 +1640,7 @@ esp_err_t control_init(void)
     set_default_speed_profile();
     set_default_auto_track_config();
     load_settings_from_nvs();
+    load_race_plan_from_nvs();
 
     BaseType_t created = xTaskCreatePinnedToCore(control_task,
                                                  "control_task",
@@ -1521,6 +1738,31 @@ esp_err_t control_set_motor_percent(control_motor_id_t motor, int percent)
     return motors_set_percent((motors_motor_id_t)motor, percent);
 }
 
+esp_err_t control_set_mapping_mode(bool enabled)
+{
+    if (!initialized || control_timer_handle == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (mapping_rate_enabled == enabled) {
+        return ESP_OK;
+    }
+
+    const uint32_t period_us = enabled ?
+                                   CONTROL_MAPPING_TASK_PERIOD_US :
+                                   CONTROL_TASK_PERIOD_US;
+    const esp_err_t ret = esp_timer_restart(control_timer_handle, period_us);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+    control_task_period_us = period_us;
+    mapping_rate_enabled = enabled;
+    ESP_LOGI(TAG,
+             "Frequencia da task de controle alterada para %.0f Hz (mapeamento=%d)",
+             enabled ? CONTROL_MAPPING_TASK_TARGET_HZ : CONTROL_TASK_TARGET_HZ,
+             enabled);
+    return ESP_OK;
+}
+
 esp_err_t control_stop_all(void)
 {
     return control_emergency_stop();
@@ -1547,7 +1789,6 @@ esp_err_t control_start_map(uint8_t map_slot, int8_t speed_percent)
     if (ret != ESP_OK) {
         return ret;
     }
-
     esp_err_t imu_ret = imu_reset_yaw();
     if (imu_ret != ESP_OK) {
         ESP_LOGW(TAG, "Falha ao resetar yaw da IMU no start do controle: %s", esp_err_to_name(imu_ret));
@@ -1575,8 +1816,12 @@ esp_err_t control_start_map(uint8_t map_slot, int8_t speed_percent)
     const bool battery_compensation_enabled = nav_state.battery_compensation_enabled;
     memset(&nav_state, 0, sizeof(nav_state));
     race_plan_runtime_enabled = false;
+    race_plan_prestart_active = false;
+    race_plan_navigation_enabled = false;
     race_plan_start_us = 0;
+    race_plan_prestart_end_us = 0;
     race_plan_track_distance_m = 0.0f;
+    race_plan_prestart_aux_percent = 0;
     nav_state.running = true;
     nav_state.mode = CONTROL_NAV_MODE_ODOMETRY;
     nav_state.map_slot = map_slot;
@@ -1603,7 +1848,6 @@ esp_err_t control_start_map(uint8_t map_slot, int8_t speed_percent)
     previous_error_rad = 0.0f;
     have_previous_error = false;
     portEXIT_CRITICAL(&state_mux);
-    reset_map_encoder_reference();
 
     ESP_LOGI(TAG,
              "Controle mapa iniciado slot=%u pontos=%u speed=%d%% origem=[%.3f %.3f] alvo=ponto%u[%.3f %.3f]",
@@ -1644,8 +1888,12 @@ esp_err_t control_start_line(int8_t speed_percent)
     const bool battery_compensation_enabled = nav_state.battery_compensation_enabled;
     memset(&nav_state, 0, sizeof(nav_state));
     race_plan_runtime_enabled = false;
+    race_plan_prestart_active = false;
+    race_plan_navigation_enabled = false;
     race_plan_start_us = 0;
+    race_plan_prestart_end_us = 0;
     race_plan_track_distance_m = 0.0f;
+    race_plan_prestart_aux_percent = 0;
     nav_state.running = true;
     nav_state.mode = CONTROL_NAV_MODE_LINE;
     nav_state.map_slot = 0;
@@ -1673,7 +1921,7 @@ esp_err_t control_start_line(int8_t speed_percent)
     return ESP_OK;
 }
 
-esp_err_t control_start_auto_track(uint8_t map_slot, int8_t speed_percent)
+esp_err_t control_start_auto_track(uint8_t map_slot, int8_t speed_percent, bool use_race_plan)
 {
     if (!initialized) {
         return ESP_ERR_INVALID_STATE;
@@ -1691,6 +1939,13 @@ esp_err_t control_start_auto_track(uint8_t map_slot, int8_t speed_percent)
     esp_err_t ret = load_active_map(map_slot, &total_points);
     if (ret != ESP_OK) {
         return ret;
+    }
+    if (use_race_plan && !race_plan_matches_active_map(total_points)) {
+        ESP_LOGE(TAG,
+                 "Plano de corrida nao cobre o mapa auto pista slot=%u pontos=%u de forma continua",
+                 (unsigned int)map_slot,
+                 (unsigned int)total_points);
+        return ESP_ERR_INVALID_SIZE;
     }
 
     esp_err_t imu_ret = imu_reset_yaw();
@@ -1717,6 +1972,7 @@ esp_err_t control_start_auto_track(uint8_t map_slot, int8_t speed_percent)
         }
     }
     const int64_t start_us = esp_timer_get_time();
+    const uint8_t prestart_aux_percent = race_plan_straight_aux_percent();
 
     bool start_race_plan_runtime = false;
     portENTER_CRITICAL(&state_mux);
@@ -1729,10 +1985,16 @@ esp_err_t control_start_auto_track(uint8_t map_slot, int8_t speed_percent)
     const bool speed_profile_enabled = nav_state.speed_profile_enabled;
     const bool battery_compensation_enabled = nav_state.battery_compensation_enabled;
     memset(&nav_state, 0, sizeof(nav_state));
-    start_race_plan_runtime = race_plan_enabled;
-    race_plan_runtime_enabled = start_race_plan_runtime;
+    start_race_plan_runtime = use_race_plan && race_plan_enabled;
+    race_plan_runtime_enabled = false;
+    race_plan_prestart_active = start_race_plan_runtime;
+    race_plan_navigation_enabled = start_race_plan_runtime;
     race_plan_direction = speed_percent < 0 ? -1 : 1;
-    race_plan_start_us = start_race_plan_runtime ? start_us : 0;
+    race_plan_start_us = 0;
+    race_plan_prestart_end_us = start_race_plan_runtime ?
+                                    start_us + ((int64_t)CONTROL_RACE_PLAN_PRESTART_DURATION_MS * 1000LL) :
+                                    0;
+    race_plan_prestart_aux_percent = start_race_plan_runtime ? prestart_aux_percent : 0;
     race_plan_track_distance_m = start_race_plan_runtime ? race_plan_distance_m : 0.0f;
     nav_state.running = true;
     nav_state.mode = CONTROL_NAV_MODE_AUTO_TRACK;
@@ -1749,10 +2011,10 @@ esp_err_t control_start_auto_track(uint8_t map_slot, int8_t speed_percent)
     nav_state.kp = kp;
     nav_state.ki = ki;
     nav_state.kd = kd;
-    nav_state.active_speed_percent = abs_speed_percent(speed_percent);
+    nav_state.active_speed_percent = start_race_plan_runtime ? 0 : abs_speed_percent(speed_percent);
     nav_state.motor_limit_percent = motor_limit_percent;
     nav_state.aux_percent = aux_percent;
-    nav_state.active_aux_percent = 0;
+    nav_state.active_aux_percent = start_race_plan_runtime ? prestart_aux_percent : 0;
     nav_state.loop_hz = loop_hz;
     nav_state.speed_profile_enabled = speed_profile_enabled;
     nav_state.battery_compensation_enabled = battery_compensation_enabled;
@@ -1760,14 +2022,24 @@ esp_err_t control_start_auto_track(uint8_t map_slot, int8_t speed_percent)
     previous_error_rad = 0.0f;
     have_previous_error = false;
     portEXIT_CRITICAL(&state_mux);
-    reset_map_encoder_reference();
+
+    if (start_race_plan_runtime) {
+        motors_brake_drive();
+        motors_set_percent(MOTORS_MOTOR_AUX, prestart_aux_percent);
+        rgb_led_set_race_plan_blink(242,
+                                    153,
+                                    74,
+                                    CONTROL_RACE_PLAN_PRESTART_BLINK_PERIOD_MS);
+    }
 
     ESP_LOGI(TAG,
-             "Auto pista iniciado slot=%u pontos=%u speed=%d%% plano_task=%u origem=[%.3f %.3f] alvo=ponto%u[%.3f %.3f]",
+             "Auto pista iniciado slot=%u pontos=%u speed=%d%% plano_task=%u prestart=%ums turbina=%u%% origem=[%.3f %.3f] alvo=ponto%u[%.3f %.3f]",
              (unsigned int)map_slot,
              (unsigned int)total_points,
              (int)speed_percent,
-             race_plan_enabled ? 1U : 0U,
+             start_race_plan_runtime ? 1U : 0U,
+             start_race_plan_runtime ? (unsigned int)CONTROL_RACE_PLAN_PRESTART_DURATION_MS : 0U,
+             (unsigned int)(start_race_plan_runtime ? prestart_aux_percent : 0U),
              active_map[0].x_m,
              active_map[0].y_m,
              (unsigned int)CONTROL_FIRST_MAP_TARGET_INDEX,
@@ -1778,6 +2050,7 @@ esp_err_t control_start_auto_track(uint8_t map_slot, int8_t speed_percent)
 
 esp_err_t control_stop_navigation(void)
 {
+    portal_stop_active = false;
     set_navigation_stopped();
     motors_set_percent(MOTORS_MOTOR_AUX, 0);
     return motors_brake_drive_for_ms(1000);
@@ -1837,6 +2110,56 @@ esp_err_t control_save_pid_settings(float kp, float ki, float kd, uint8_t limit_
                  kd,
                  (unsigned int)limit_percent,
                  (unsigned int)aux_percent);
+    }
+    return ret;
+}
+
+esp_err_t control_begin_portal_stop(uint8_t speed_percent)
+{
+    if (!initialized || speed_percent > 100) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    portENTER_CRITICAL(&state_mux);
+    if (!nav_state.running) {
+        portEXIT_CRITICAL(&state_mux);
+        return ESP_ERR_INVALID_STATE;
+    }
+    portal_stop_speed_percent = speed_percent;
+    portal_stop_active = true;
+    portEXIT_CRITICAL(&state_mux);
+    return ESP_OK;
+}
+
+esp_err_t control_set_line_alpha(float alpha)
+{
+    if (!initialized) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!line_alpha_is_valid(alpha)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    portENTER_CRITICAL(&state_mux);
+    line_alpha = alpha;
+    nav_state.line_alpha = line_alpha;
+    error_integral_rad_s = 0.0f;
+    previous_error_rad = 0.0f;
+    have_previous_error = false;
+    portEXIT_CRITICAL(&state_mux);
+
+    ESP_LOGI(TAG, "Alpha controle linha ajustado %.3f", alpha);
+    return ESP_OK;
+}
+
+esp_err_t control_save_line_alpha(float alpha)
+{
+    esp_err_t ret = control_set_line_alpha(alpha);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+    ret = save_line_alpha_to_nvs(alpha);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Falha ao salvar alpha controle linha: %s", esp_err_to_name(ret));
     }
     return ret;
 }
@@ -1945,11 +2268,16 @@ esp_err_t control_set_race_plan(const control_race_plan_segment_t *segments, siz
         race_plan_segment_count = 0;
         race_plan_enabled = false;
         race_plan_runtime_enabled = false;
+        race_plan_prestart_active = false;
+        race_plan_navigation_enabled = false;
         race_plan_start_us = 0;
+        race_plan_prestart_end_us = 0;
         race_plan_track_distance_m = 0.0f;
+        race_plan_prestart_aux_percent = 0;
         portEXIT_CRITICAL(&state_mux);
-        ESP_LOGI(TAG, "Plano de corrida desabilitado");
-        return ESP_OK;
+        const esp_err_t save_ret = save_race_plan_to_nvs();
+        ESP_LOGI(TAG, "Plano de corrida desabilitado save=%s", esp_err_to_name(save_ret));
+        return save_ret;
     }
     if (!race_plan_is_valid(segments, count) || count == 0) {
         return ESP_ERR_INVALID_ARG;
@@ -1964,6 +2292,7 @@ esp_err_t control_set_race_plan(const control_race_plan_segment_t *segments, siz
     race_plan_enabled = true;
     if (nav_state.running && nav_state.mode == CONTROL_NAV_MODE_AUTO_TRACK) {
         race_plan_runtime_enabled = true;
+        race_plan_navigation_enabled = true;
         race_plan_direction = nav_state.speed_percent < 0 ? -1 : 1;
         race_plan_start_us = start_us;
         race_plan_track_distance_m = nav_state.point_count > 1 ?
@@ -1978,7 +2307,13 @@ esp_err_t control_set_race_plan(const control_race_plan_segment_t *segments, siz
     have_previous_error = false;
     portEXIT_CRITICAL(&state_mux);
 
-    ESP_LOGI(TAG, "Plano de corrida aplicado segmentos=%u", (unsigned int)count);
+    const esp_err_t save_ret = save_race_plan_to_nvs();
+    if (save_ret != ESP_OK) {
+        ESP_LOGW(TAG, "Falha ao salvar plano de corrida: %s", esp_err_to_name(save_ret));
+        return save_ret;
+    }
+
+    ESP_LOGI(TAG, "Plano de corrida aplicado e salvo segmentos=%u", (unsigned int)count);
     for (size_t i = 0; i < count; ++i) {
         const control_race_plan_segment_t *segment = &segments[i];
         ESP_LOGI(TAG,

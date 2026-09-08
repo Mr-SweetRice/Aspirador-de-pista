@@ -64,10 +64,11 @@ class NavigationControlPanel(QWidget):
     line_start_requested = Signal(int)
     auto_track_start_requested = Signal(int, int, int)
     stop_requested = Signal()
-    pid_requested = Signal(float, float, float, int)
-    pid_save_requested = Signal(float, float, float, int, int)
+    pid_requested = Signal(float, float, float, int, float)
+    pid_save_requested = Signal(float, float, float, int, int, float)
     aux_requested = Signal(int)
     battery_compensation_requested = Signal(bool)
+    zero_brake_requested = Signal(bool)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -79,7 +80,7 @@ class NavigationControlPanel(QWidget):
         self._robot_pose_override: tuple[float, float, float] | None = None
         self._updating_maps = False
         self._pid_dirty = False
-        self._pending_pid: tuple[float, float, float, int] | None = None
+        self._pending_pid: tuple[float, float, float, int, float] | None = None
         self._aux_dirty = False
         self._pending_aux: int | None = None
         self._error_history: list[float] = []
@@ -129,6 +130,9 @@ class NavigationControlPanel(QWidget):
         self.kd_input = PidDoubleSpinBox()
         self._configure_pid_input(self.kd_input, 0.01)
         self.kd_input.setValue(0.0)
+        self.alpha_input = PidDoubleSpinBox()
+        self._configure_pid_input(self.alpha_input, 0.01, minimum=0.0, maximum=1.0)
+        self.alpha_input.setValue(0.7)
         self.motor_limit_input = QSpinBox()
         self.motor_limit_input.setRange(0, 100)
         self.motor_limit_input.setValue(100)
@@ -136,6 +140,9 @@ class NavigationControlPanel(QWidget):
         self.apply_pid_button = QPushButton("Salvar PID/limite/turbina")
         self.battery_compensation_check = QCheckBox("Compensar pela tensao da bateria")
         self.battery_compensation_check.setToolTip("Corrige PWM usando tensao atual da bateria contra 12,6 V")
+        self.zero_brake_check = QCheckBox("Freio em 0%")
+        self.zero_brake_check.setChecked(True)
+        self.zero_brake_check.setToolTip("Quando ligado, comando 0% usa short brake no TB6612; desligado deixa o motor livre")
 
         buttons = QWidget()
         buttons_layout = QHBoxLayout(buttons)
@@ -153,8 +160,10 @@ class NavigationControlPanel(QWidget):
         command_layout.addRow("Kp", self.kp_input)
         command_layout.addRow("Ki", self.ki_input)
         command_layout.addRow("Kd", self.kd_input)
+        command_layout.addRow("Alpha P", self.alpha_input)
         command_layout.addRow("Limite motor", self.motor_limit_input)
         command_layout.addRow(self.battery_compensation_check)
+        command_layout.addRow(self.zero_brake_check)
         command_layout.addRow(self.apply_pid_button)
         command_layout.addRow(buttons)
         side_layout.addWidget(command_group)
@@ -276,11 +285,13 @@ class NavigationControlPanel(QWidget):
         self.mode_combo.currentIndexChanged.connect(self._refresh_mode_visibility)
         self.apply_pid_button.clicked.connect(self._emit_pid_save)
         self.battery_compensation_check.toggled.connect(self.battery_compensation_requested)
+        self.zero_brake_check.toggled.connect(self.zero_brake_requested)
         self.kp_input.valueChanged.connect(self._schedule_pid_live)
         self.ki_input.valueChanged.connect(self._schedule_pid_live)
         self.kd_input.valueChanged.connect(self._schedule_pid_live)
+        self.alpha_input.valueChanged.connect(self._schedule_pid_live)
         self.motor_limit_input.valueChanged.connect(self._schedule_pid_live)
-        for pid_input in (self.kp_input, self.ki_input, self.kd_input, self.motor_limit_input):
+        for pid_input in (self.kp_input, self.ki_input, self.kd_input, self.alpha_input, self.motor_limit_input):
             pid_input.lineEdit().textEdited.connect(self._mark_pid_editing)
             pid_input.editingFinished.connect(self._schedule_pid_live)
         self.aux_input.valueChanged.connect(self._schedule_aux_live)
@@ -343,6 +354,7 @@ class NavigationControlPanel(QWidget):
             state.control_ki,
             state.control_kd,
             state.control_motor_limit_percent,
+            state.control_line_alpha,
         )
         if self._pending_pid and self._pid_matches(self._pending_pid, actual_pid):
             self._pending_pid = None
@@ -373,7 +385,9 @@ class NavigationControlPanel(QWidget):
         self.distance_label.setText(f"{state.control_distance_m:.3f} m")
         self.target_xy_label.setText(f"{state.control_target_x_m:.3f}, {state.control_target_y_m:.3f}")
         self.steer_label.setText(f"{state.control_steer_percent:.1f} %")
-        self.pid_label.setText(f"{state.control_kp:.3f}, {state.control_ki:.3f}, {state.control_kd:.3f}")
+        self.pid_label.setText(
+            f"{state.control_kp:.3f}, {state.control_ki:.3f}, {state.control_kd:.3f} | alpha {state.control_line_alpha:.3f}"
+        )
         self.limit_label.setText(f"{state.control_motor_limit_percent} % | {mode_label} | {battery_label}")
         self.active_speed_label.setText(f"{state.control_active_speed_percent} % | alvo {state.control_speed_percent} %")
         self.aux_label.setText(f"{state.control_aux_percent} % | ativo {state.control_active_aux_percent} %")
@@ -385,22 +399,31 @@ class NavigationControlPanel(QWidget):
         self._draw_target(state)
         self._draw_error(state)
 
+    def set_zero_brake_enabled(self, enabled: bool) -> None:
+        self.zero_brake_check.blockSignals(True)
+        self.zero_brake_check.setChecked(bool(enabled))
+        self.zero_brake_check.blockSignals(False)
+
+    def cancel_pending_commands(self) -> None:
+        self._pid_timer.stop()
+        self._aux_timer.stop()
+
     def _emit_start(self) -> None:
         mode = int(self.mode_combo.currentData())
         if mode == CONTROL_MODE_LINE:
-            delay_ms = 180 if self._emit_auto_reset_to_first_point() else 0
-            QTimer.singleShot(delay_ms, lambda: self.line_start_requested.emit(int(self.speed_input.value())))
+            self._emit_auto_reset_to_first_point()
+            self.line_start_requested.emit(int(self.speed_input.value()))
             return
         data = self.map_combo.currentData()
         if not data:
             return
-        delay_ms = 180 if self._emit_auto_reset_to_first_point() else 0
+        self._emit_auto_reset_to_first_point()
         slot = int(data["slot"])
         speed = int(self.speed_input.value())
         if mode == CONTROL_MODE_AUTO_TRACK:
-            QTimer.singleShot(delay_ms, lambda: self.auto_track_start_requested.emit(slot, speed, ODOMETRY_SOURCE_FUSED))
+            self.auto_track_start_requested.emit(slot, speed, ODOMETRY_SOURCE_FUSED)
         else:
-            QTimer.singleShot(delay_ms, lambda: self.start_requested.emit(slot, speed, ODOMETRY_SOURCE_FUSED))
+            self.start_requested.emit(slot, speed, ODOMETRY_SOURCE_FUSED)
 
     def _emit_map_load(self) -> None:
         if self._updating_maps:
@@ -438,13 +461,14 @@ class NavigationControlPanel(QWidget):
         self.map_plot.setVisible(not collapsed and self.view_combo.currentData() == "map")
         self.error_plot.setVisible(not collapsed and self.view_combo.currentData() == "error")
 
-    def _current_pid(self) -> tuple[float, float, float, int]:
+    def _current_pid(self) -> tuple[float, float, float, int, float]:
         self._interpret_pid_inputs()
         return (
             float(self.kp_input.value()),
             float(self.ki_input.value()),
             float(self.kd_input.value()),
             int(self.motor_limit_input.value()),
+            float(self.alpha_input.value()),
         )
 
     def _emit_pid_live(self) -> None:
@@ -454,12 +478,14 @@ class NavigationControlPanel(QWidget):
         self.pid_requested.emit(*pid)
 
     def _emit_pid_save(self) -> None:
+        self._pid_timer.stop()
         self._interpret_pid_inputs()
         pid = (
             float(self.kp_input.value()),
             float(self.ki_input.value()),
             float(self.kd_input.value()),
             int(self.motor_limit_input.value()),
+            float(self.alpha_input.value()),
         )
         self._pending_pid = pid
         self._pid_dirty = False
@@ -467,12 +493,13 @@ class NavigationControlPanel(QWidget):
         aux = int(self.aux_input.value())
         self._pending_aux = aux
         self._aux_dirty = False
-        self.pid_save_requested.emit(*pid, aux)
+        self.pid_save_requested.emit(pid[0], pid[1], pid[2], pid[3], aux, pid[4])
 
     def finish_pid_save(self, success: bool) -> None:
-        self._pending_pid = None
+        if not success:
+            self._pending_pid = None
         self._pending_aux = None
-        self._pid_dirty = False
+        self._pid_dirty = not success
         self._aux_dirty = False
         self.apply_pid_button.setText("PID salvo" if success else "Falha ao salvar PID")
         QTimer.singleShot(1200, lambda: self.apply_pid_button.setText("Salvar PID/limite/turbina"))
@@ -489,15 +516,16 @@ class NavigationControlPanel(QWidget):
         self.apply_pid_button.setText("Salvar PID/limite/turbina")
 
     def _interpret_pid_inputs(self) -> None:
-        for widget in (self.kp_input, self.ki_input, self.kd_input, self.motor_limit_input):
+        for widget in (self.kp_input, self.ki_input, self.kd_input, self.alpha_input, self.motor_limit_input):
             widget.interpretText()
 
-    def _set_pid_inputs(self, pid: tuple[float, float, float, int]) -> None:
+    def _set_pid_inputs(self, pid: tuple[float, float, float, int, float]) -> None:
         widgets = [
             (self.kp_input, pid[0]),
             (self.ki_input, pid[1]),
             (self.kd_input, pid[2]),
             (self.motor_limit_input, pid[3]),
+            (self.alpha_input, pid[4]),
         ]
         for widget, value in widgets:
             widget.blockSignals(True)
@@ -521,17 +549,18 @@ class NavigationControlPanel(QWidget):
         self.aux_input.blockSignals(False)
 
     @staticmethod
-    def _pid_matches(a: tuple[float, float, float, int], b: tuple[float, float, float, int]) -> bool:
+    def _pid_matches(a: tuple[float, float, float, int, float], b: tuple[float, float, float, int, float]) -> bool:
         return (
             isclose(a[0], b[0], abs_tol=0.002)
             and isclose(a[1], b[1], abs_tol=0.002)
             and isclose(a[2], b[2], abs_tol=0.002)
             and int(a[3]) == int(b[3])
+            and isclose(a[4], b[4], abs_tol=0.002)
         )
 
     @staticmethod
-    def _configure_pid_input(widget: QDoubleSpinBox, step: float) -> None:
-        widget.setRange(0.0, 1000.0)
+    def _configure_pid_input(widget: QDoubleSpinBox, step: float, minimum: float = 0.0, maximum: float = 1000.0) -> None:
+        widget.setRange(minimum, maximum)
         widget.setDecimals(3)
         widget.setSingleStep(step)
         widget.setLocale(QLocale.c())

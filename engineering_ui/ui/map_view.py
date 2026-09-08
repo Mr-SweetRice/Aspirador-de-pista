@@ -63,6 +63,7 @@ class MapView(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._recording = False
+        self._record_requested: bool | None = None
         self._editing = False
         self._selected_index: int | None = None
         self._recorded_points: list[tuple[float, float]] = []
@@ -75,8 +76,6 @@ class MapView(QWidget):
         self._rejected_record_points = 0
         self._record_distance_m = 0.0
         self._syncing_record_button = False
-        self._loaded_index_labels: list[pg.TextItem] = []
-        self._recorded_index_labels: list[pg.TextItem] = []
 
         root = QHBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -127,8 +126,6 @@ class MapView(QWidget):
         self.load_progress.hide()
         self.show_loaded_map = QCheckBox("Exibir no mapa")
         self.show_loaded_map.setChecked(True)
-        self.show_index_labels = QCheckBox("Exibir indices")
-        self.show_index_labels.setChecked(True)
         self.edit_button = QPushButton("Editar mapa")
         self.edit_button.setCheckable(True)
         self.save_edit_button = QPushButton("Salvar edicao")
@@ -137,7 +134,6 @@ class MapView(QWidget):
         self.load_map_button.clicked.connect(self._load_selected_map)
         self.delete_map_button.clicked.connect(self._delete_selected_map)
         self.show_loaded_map.toggled.connect(self._draw_loaded_map)
-        self.show_index_labels.toggled.connect(self._redraw_index_labels)
         self.edit_button.toggled.connect(self._set_editing)
         self.save_edit_button.clicked.connect(self._save_edit)
 
@@ -147,7 +143,6 @@ class MapView(QWidget):
         menu.addWidget(self.delete_map_button)
         menu.addWidget(self.load_progress)
         menu.addWidget(self.show_loaded_map)
-        menu.addWidget(self.show_index_labels)
         menu.addWidget(self.edit_button)
         menu.addWidget(self.save_edit_button)
 
@@ -159,8 +154,11 @@ class MapView(QWidget):
         menu.addStretch(1)
         self.record_status = QLabel("0 pontos")
         self.map_distance_status = QLabel("pista: 0.000 m")
+        self.mapping_rate_status = QLabel("capacidade: ate 50 m")
+        self.mapping_rate_status.setWordWrap(True)
         menu.addWidget(self.record_status)
         menu.addWidget(self.map_distance_status)
+        menu.addWidget(self.mapping_rate_status)
         root.addWidget(self.sidebar, 0)
 
         self.plot = EditableMapPlot(self)
@@ -206,7 +204,6 @@ class MapView(QWidget):
         self._loading_received = 0
         self.loaded_path.clear()
         self.loaded_points_item.clear()
-        self._clear_loaded_index_labels()
         self.load_progress.setRange(0, max(1, total_points))
         self.load_progress.setValue(0)
         self.load_progress.setFormat("Carregando mapa: 0%")
@@ -245,6 +242,13 @@ class MapView(QWidget):
             path = self._polyline_array(state.fused_path_history, self.RECORD_MAX_STEP_M)
             self.fused_path.setData(path[:, 0], path[:, 1])
         self.robot_marker.set_pose(state.fused_x_m, state.fused_y_m, state.fused_heading_rad)
+        if self._recording:
+            self.mapping_rate_status.setText(
+                f"mapeando ate 50 m | controle {state.control_loop_hz:.0f} Hz | "
+                f"linha {state.line_sensor_loop_hz:.0f} Hz | alvo 750 Hz"
+            )
+        else:
+            self.mapping_rate_status.setText("capacidade: ate 50 m | resolucao: 2 cm")
 
     def _toggle_sidebar(self) -> None:
         self.sidebar.setVisible(self.menu_toggle.isChecked())
@@ -252,6 +256,7 @@ class MapView(QWidget):
     def _set_recording(self, enabled: bool) -> None:
         if self._syncing_record_button:
             return
+        self._record_requested = enabled
         self._recording = enabled
         self.record_button.setText("Stop record" if enabled else "Start record")
         if enabled:
@@ -300,7 +305,6 @@ class MapView(QWidget):
         self._loading_map = False
         self.loaded_path.clear()
         self.loaded_points_item.clear()
-        self._clear_loaded_index_labels()
         self.load_progress.hide()
         self._update_distance_status()
 
@@ -315,11 +319,9 @@ class MapView(QWidget):
         self.map_distance_status.setText(f"gravacao: {distance:.3f} m")
         if not self._recorded_points:
             self.recorded_path.clear()
-            self._clear_recorded_index_labels()
             return
         points = self._polyline_array(self._recorded_points, self.RECORD_MAX_STEP_M)
         self.recorded_path.setData(points[:, 0], points[:, 1])
-        self._draw_index_labels(self._recorded_points, self._recorded_index_labels, "#27ae60", set(gap_indexes))
 
     def set_recorded_chunk(
         self,
@@ -347,7 +349,15 @@ class MapView(QWidget):
         self._set_record_button_state(active)
         self._draw_recording()
 
+    @property
+    def recording_request_pending(self) -> bool:
+        return self._record_requested is not None
+
     def _set_record_button_state(self, active: bool) -> None:
+        if self._record_requested is not None:
+            if active != self._record_requested:
+                return  # A snapshot from before START/STOP must not undo the user's click.
+            self._record_requested = None
         if self._recording == active and self.record_button.isChecked() == active:
             return
         self._syncing_record_button = True
@@ -361,7 +371,6 @@ class MapView(QWidget):
         if not visible:
             self.loaded_path.clear()
             self.loaded_points_item.clear()
-            self._clear_loaded_index_labels()
             self._update_distance_status()
             return
 
@@ -378,7 +387,6 @@ class MapView(QWidget):
                 brush = "#f2c94c"
             spots.append({"pos": point, "data": index, "brush": brush})
         self.loaded_points_item.setData(spots)
-        self._draw_index_labels(self._loaded_points, self._loaded_index_labels, "#f2c94c", gap_indexes)
         self._update_distance_status()
 
     def handle_plot_mouse_press(self, event) -> bool:
@@ -448,41 +456,6 @@ class MapView(QWidget):
         if len(points) < 2:
             return 0.0
         return sum(self._distance(points[index - 1], points[index]) for index in range(1, len(points)))
-
-    def _redraw_index_labels(self) -> None:
-        self._clear_recorded_index_labels()
-        self._clear_loaded_index_labels()
-        self._draw_recording()
-        self._draw_loaded_map()
-
-    def _draw_index_labels(
-        self,
-        points: list[tuple[float, float]],
-        labels: list[pg.TextItem],
-        color: str,
-        gap_indexes: set[int],
-    ) -> None:
-        while labels:
-            self.plot.removeItem(labels.pop())
-        if not self.show_index_labels.isChecked():
-            return
-
-        for index, point in enumerate(points):
-            if not all(math.isfinite(value) for value in point):
-                continue
-            label_color = "#eb5757" if index in gap_indexes else color
-            label = pg.TextItem(str(index), color=label_color, anchor=(0.0, 1.0))
-            label.setPos(float(point[0]), float(point[1]))
-            self.plot.addItem(label)
-            labels.append(label)
-
-    def _clear_loaded_index_labels(self) -> None:
-        while self._loaded_index_labels:
-            self.plot.removeItem(self._loaded_index_labels.pop())
-
-    def _clear_recorded_index_labels(self) -> None:
-        while self._recorded_index_labels:
-            self.plot.removeItem(self._recorded_index_labels.pop())
 
     @classmethod
     def _gap_indexes(cls, points: list[tuple[float, float]], max_segment_m: float) -> list[int]:

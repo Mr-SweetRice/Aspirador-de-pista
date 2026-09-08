@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import math
+from pathlib import Path
+import struct
 
 import numpy as np
 import pyqtgraph as pg
@@ -11,10 +14,12 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
+    QFileDialog,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QMessageBox,
     QPushButton,
     QProgressBar,
     QScrollArea,
@@ -40,9 +45,9 @@ from ui.robot_marker import GpsRobotMarker
 
 
 SEGMENT_COLORS = {
-    RACE_SEGMENT_NORMAL: "#27ae60",
-    RACE_SEGMENT_INTERSECTION: "#56ccf2",
-    RACE_SEGMENT_CURVE: "#f2994a",
+    RACE_SEGMENT_NORMAL: "#46ff00",
+    RACE_SEGMENT_INTERSECTION: "#1b0fff",
+    RACE_SEGMENT_CURVE: "#ff3600",
     RACE_SEGMENT_STOP: "#eb5757",
 }
 
@@ -65,10 +70,39 @@ PROFILE_DEFAULTS = {
 PID_MIN_GAIN = 0.0
 PID_MAX_GAIN = 1000.0
 PID_DECIMALS = 3
+RACE_PLAN_FILE_FORMAT = "aspirador-de-pista-race-plan"
+RACE_PLAN_FILE_VERSION = 1
 
 
 def _parse_decimal(text: str) -> float:
     return float(str(text).strip().replace(",", "."))
+
+
+def _require_json_int(value: object, field: str, minimum: int, maximum: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{field} deve ser inteiro")
+    number = float(value)
+    if not math.isfinite(number) or not number.is_integer():
+        raise ValueError(f"{field} deve ser inteiro")
+    result = int(number)
+    if not minimum <= result <= maximum:
+        raise ValueError(f"{field} fora da faixa {minimum}..{maximum}")
+    return result
+
+
+def _require_json_float(value: object, field: str, minimum: float, maximum: float) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{field} deve ser numerico")
+    result = float(value)
+    if not math.isfinite(result) or not minimum <= result <= maximum:
+        raise ValueError(f"{field} fora da faixa {minimum:g}..{maximum:g}")
+    return result
+
+
+def _require_json_bool(value: object, field: str) -> bool:
+    if not isinstance(value, bool):
+        raise ValueError(f"{field} deve ser booleano")
+    return value
 
 
 class PidDoubleSpinBox(QDoubleSpinBox):
@@ -195,6 +229,15 @@ class RacePlanPanel(QWidget):
         button_layout.addWidget(self.start_button)
         button_layout.addWidget(self.stop_button)
         config_layout.addRow(buttons)
+
+        file_buttons = QWidget()
+        file_button_layout = QHBoxLayout(file_buttons)
+        file_button_layout.setContentsMargins(0, 0, 0, 0)
+        self.save_plan_file_button = QPushButton("Salvar JSON")
+        self.load_plan_file_button = QPushButton("Carregar JSON")
+        file_button_layout.addWidget(self.save_plan_file_button)
+        file_button_layout.addWidget(self.load_plan_file_button)
+        config_layout.addRow("Arquivo", file_buttons)
         panel_layout.addWidget(config_group)
 
         profile_group = QGroupBox("Padroes do plano")
@@ -299,6 +342,8 @@ class RacePlanPanel(QWidget):
         self.apply_button.clicked.connect(self._emit_apply)
         self.start_button.clicked.connect(self._emit_start)
         self.stop_button.clicked.connect(self.stop_requested)
+        self.save_plan_file_button.clicked.connect(self._save_plan_file)
+        self.load_plan_file_button.clicked.connect(self._load_plan_file)
         self.add_segment_button.clicked.connect(self._add_segment)
         self.remove_segment_button.clicked.connect(self._remove_selected_segment)
         self.auto_detect_button.clicked.connect(self._auto_detect_segments)
@@ -395,9 +440,10 @@ class RacePlanPanel(QWidget):
 
     def _emit_apply(self) -> None:
         config = self._read_config()
-        segments = self._read_segments()
-        if not segments:
-            self.status_label.setText("sem segmentos")
+        try:
+            segments = self._validated_current_segments()
+        except (TypeError, ValueError) as exc:
+            self.status_label.setText(f"plano invalido: {exc}")
             return
         self._save_current_settings()
         self.apply_requested.emit(config, segments, self.battery_compensation_check.isChecked())
@@ -405,12 +451,13 @@ class RacePlanPanel(QWidget):
 
     def _emit_start(self) -> None:
         data = self.map_combo.currentData()
-        segments = self._read_segments()
         if not data:
             self.status_label.setText("sem mapa")
             return
-        if not segments:
-            self.status_label.setText("sem segmentos")
+        try:
+            segments = self._validated_current_segments()
+        except (TypeError, ValueError) as exc:
+            self.status_label.setText(f"plano invalido: {exc}")
             return
         self.set_robot_at_first_point()
         self._save_current_settings()
@@ -422,6 +469,343 @@ class RacePlanPanel(QWidget):
             self.battery_compensation_check.isChecked(),
         )
         self.status_label.setText("iniciando")
+
+    @staticmethod
+    def _map_signature(points: list[tuple[float, float]]) -> str:
+        digest = hashlib.sha256()
+        for x_m, y_m in points:
+            x_value = float(x_m)
+            y_value = float(y_m)
+            if not math.isfinite(x_value) or not math.isfinite(y_value):
+                raise ValueError("mapa possui ponto invalido")
+            digest.update(struct.pack("<ff", x_value, y_value))
+        return digest.hexdigest()
+
+    def _loaded_map_context(self) -> tuple[dict, int]:
+        data = self.map_combo.currentData()
+        if (
+            self._loading_map
+            or self._loaded_slot is None
+            or len(self._loaded_points) < 2
+            or not isinstance(data, dict)
+            or int(data.get("slot", -1)) != self._loaded_slot
+        ):
+            raise ValueError("carregue completamente o mapa antes de salvar ou carregar o plano")
+        return data, len(self._loaded_points)
+
+    def _read_profiles_for_file(self) -> dict[int, tuple[int, int, int, float, float, float]]:
+        profiles: dict[int, tuple[int, int, int, float, float, float]] = {}
+        for row, (segment_type, label) in enumerate(PROFILE_ROWS):
+            try:
+                raw_values = [self.profile_table.item(row, column).text() for column in range(6)]
+            except AttributeError as exc:
+                raise ValueError(f"perfil {label} incompleto") from exc
+            profiles[segment_type] = (
+                _require_json_int(_parse_decimal(raw_values[0]), f"perfil {label}.velocidade", 0, 100),
+                _require_json_int(_parse_decimal(raw_values[1]), f"perfil {label}.velocidade maxima", 0, 100),
+                _require_json_int(_parse_decimal(raw_values[2]), f"perfil {label}.turbina", 0, 100),
+                _require_json_float(_parse_decimal(raw_values[3]), f"perfil {label}.kp", PID_MIN_GAIN, PID_MAX_GAIN),
+                _require_json_float(_parse_decimal(raw_values[4]), f"perfil {label}.ki", PID_MIN_GAIN, PID_MAX_GAIN),
+                _require_json_float(_parse_decimal(raw_values[5]), f"perfil {label}.kd", PID_MIN_GAIN, PID_MAX_GAIN),
+            )
+        return profiles
+
+    def _build_plan_file_payload(self) -> dict:
+        map_data, point_count = self._loaded_map_context()
+        profiles = self._read_profiles_for_file()
+        segments = self._validated_current_segments()
+
+        segment_payload = [
+            {
+                "start_index": start,
+                "end_index": end,
+                "type": segment_type,
+                "type_name": RACE_SEGMENT_LABELS.get(segment_type, str(segment_type)),
+                "speed_percent": speed,
+                "max_speed_percent": max_speed,
+                "aux_percent": aux,
+                "kp": kp,
+                "ki": ki,
+                "kd": kd,
+            }
+            for start, end, segment_type, speed, max_speed, aux, kp, ki, kd in segments
+        ]
+
+        profile_payload = [
+            {
+                "type": segment_type,
+                "type_name": RACE_SEGMENT_LABELS.get(segment_type, str(segment_type)),
+                "speed_percent": values[0],
+                "max_speed_percent": values[1],
+                "aux_percent": values[2],
+                "kp": values[3],
+                "ki": values[4],
+                "kd": values[5],
+            }
+            for segment_type, values in profiles.items()
+        ]
+
+        return {
+            "format": RACE_PLAN_FILE_FORMAT,
+            "version": RACE_PLAN_FILE_VERSION,
+            "map": {
+                "slot": self._loaded_slot,
+                "name": str(map_data.get("name", "")),
+                "point_count": point_count,
+                "distance_m": _require_json_float(
+                    map_data.get("distance_m", 0.0), "map.distance_m", 0.0, 1000000.0
+                ),
+                "points_sha256": self._map_signature(self._loaded_points),
+            },
+            "config": {
+                "start_speed_percent": int(self.start_speed_input.value()),
+                "line_loss_odometry_enabled": self.line_loss_odometry_check.isChecked(),
+                "battery_compensation_enabled": self.battery_compensation_check.isChecked(),
+                "auto_detect_enabled": self.auto_detect_check.isChecked(),
+                "curve_threshold_deg": int(self.curve_threshold_input.value()),
+                "transition_extension_points": int(self.transition_extension_input.value()),
+            },
+            "profiles": profile_payload,
+            "segments": segment_payload,
+        }
+
+    @staticmethod
+    def _parse_profile_entries(raw_profiles: object) -> dict[int, tuple[int, int, int, float, float, float]]:
+        if not isinstance(raw_profiles, list) or len(raw_profiles) != len(PROFILE_ROWS):
+            raise ValueError(f"profiles deve conter {len(PROFILE_ROWS)} perfis")
+
+        profiles: dict[int, tuple[int, int, int, float, float, float]] = {}
+        valid_types = {segment_type for segment_type, _label in PROFILE_ROWS}
+        for index, entry in enumerate(raw_profiles):
+            if not isinstance(entry, dict):
+                raise ValueError(f"profiles[{index}] deve ser objeto")
+            segment_type = _require_json_int(entry.get("type"), f"profiles[{index}].type", 0, 255)
+            if segment_type not in valid_types or segment_type in profiles:
+                raise ValueError(f"profiles[{index}].type invalido ou duplicado")
+            prefix = f"profiles[{index}]"
+            profiles[segment_type] = (
+                _require_json_int(entry.get("speed_percent"), f"{prefix}.speed_percent", 0, 100),
+                _require_json_int(entry.get("max_speed_percent"), f"{prefix}.max_speed_percent", 0, 100),
+                _require_json_int(entry.get("aux_percent"), f"{prefix}.aux_percent", 0, 100),
+                _require_json_float(entry.get("kp"), f"{prefix}.kp", PID_MIN_GAIN, PID_MAX_GAIN),
+                _require_json_float(entry.get("ki"), f"{prefix}.ki", PID_MIN_GAIN, PID_MAX_GAIN),
+                _require_json_float(entry.get("kd"), f"{prefix}.kd", PID_MIN_GAIN, PID_MAX_GAIN),
+            )
+
+        if set(profiles) != valid_types:
+            raise ValueError("arquivo nao contem todos os tipos de perfil")
+        return profiles
+
+    @staticmethod
+    def _parse_segment_entries(raw_segments: object, point_count: int) -> list[tuple[int, int, int, int, int, int, float, float, float]]:
+        if not isinstance(raw_segments, list) or not raw_segments:
+            raise ValueError("segments deve conter ao menos um segmento")
+        if len(raw_segments) > RACE_PLAN_MAX_SEGMENTS:
+            raise ValueError(f"plano limitado a {RACE_PLAN_MAX_SEGMENTS} segmentos")
+
+        segments: list[tuple[int, int, int, int, int, int, float, float, float]] = []
+        expected_start = 1
+        last_map_index = point_count - 1
+        valid_types = set(RACE_SEGMENT_LABELS)
+        for index, entry in enumerate(raw_segments):
+            if not isinstance(entry, dict):
+                raise ValueError(f"segments[{index}] deve ser objeto")
+            prefix = f"segments[{index}]"
+            start = _require_json_int(entry.get("start_index"), f"{prefix}.start_index", 1, last_map_index)
+            end = _require_json_int(entry.get("end_index"), f"{prefix}.end_index", 1, last_map_index)
+            segment_type = _require_json_int(entry.get("type"), f"{prefix}.type", 0, 255)
+            if start > end:
+                raise ValueError(f"{prefix} possui inicio maior que fim")
+            if start != expected_start:
+                raise ValueError(
+                    f"{prefix}.start_index deve ser {expected_start} para manter cobertura continua"
+                )
+            if segment_type not in valid_types:
+                raise ValueError(f"{prefix}.type invalido")
+            segments.append(
+                (
+                    start,
+                    end,
+                    segment_type,
+                    _require_json_int(entry.get("speed_percent"), f"{prefix}.speed_percent", 0, 100),
+                    _require_json_int(entry.get("max_speed_percent"), f"{prefix}.max_speed_percent", 0, 100),
+                    _require_json_int(entry.get("aux_percent"), f"{prefix}.aux_percent", 0, 100),
+                    _require_json_float(entry.get("kp"), f"{prefix}.kp", PID_MIN_GAIN, PID_MAX_GAIN),
+                    _require_json_float(entry.get("ki"), f"{prefix}.ki", PID_MIN_GAIN, PID_MAX_GAIN),
+                    _require_json_float(entry.get("kd"), f"{prefix}.kd", PID_MIN_GAIN, PID_MAX_GAIN),
+                )
+            )
+            expected_start = end + 1
+        if expected_start != point_count:
+            raise ValueError(
+                f"ultimo segmento deve terminar no indice {last_map_index} para cobrir todo o mapa"
+            )
+        return segments
+
+    def _parse_plan_file_payload(
+        self,
+        payload: object,
+    ) -> tuple[
+        dict,
+        dict[int, tuple[int, int, int, float, float, float]],
+        list[tuple[int, int, int, int, int, int, float, float, float]],
+    ]:
+        _map_data, point_count = self._loaded_map_context()
+        if not isinstance(payload, dict):
+            raise ValueError("raiz do arquivo deve ser um objeto")
+        if payload.get("format") != RACE_PLAN_FILE_FORMAT:
+            raise ValueError("formato de arquivo de plano desconhecido")
+        version = _require_json_int(payload.get("version"), "version", 1, RACE_PLAN_FILE_VERSION)
+        if version != RACE_PLAN_FILE_VERSION:
+            raise ValueError(f"versao {version} nao suportada")
+
+        map_info = payload.get("map")
+        if not isinstance(map_info, dict):
+            raise ValueError("map deve ser objeto")
+        saved_point_count = _require_json_int(map_info.get("point_count"), "map.point_count", 2, 65535)
+        if saved_point_count != point_count:
+            raise ValueError(
+                f"plano usa mapa com {saved_point_count} pontos; mapa atual possui {point_count}"
+            )
+        saved_signature = map_info.get("points_sha256")
+        if not isinstance(saved_signature, str) or len(saved_signature) != 64:
+            raise ValueError("map.points_sha256 invalido")
+        if saved_signature.lower() != self._map_signature(self._loaded_points):
+            saved_name = str(map_info.get("name", "outro mapa"))
+            raise ValueError(f"plano pertence a uma geometria diferente ({saved_name})")
+
+        raw_config = payload.get("config")
+        if not isinstance(raw_config, dict):
+            raise ValueError("config deve ser objeto")
+        config = {
+            "start_speed_percent": _require_json_int(
+                raw_config.get("start_speed_percent"), "config.start_speed_percent", 1, 100
+            ),
+            "line_loss_odometry_enabled": _require_json_bool(
+                raw_config.get("line_loss_odometry_enabled"), "config.line_loss_odometry_enabled"
+            ),
+            "battery_compensation_enabled": _require_json_bool(
+                raw_config.get("battery_compensation_enabled"), "config.battery_compensation_enabled"
+            ),
+            "auto_detect_enabled": _require_json_bool(
+                raw_config.get("auto_detect_enabled"), "config.auto_detect_enabled"
+            ),
+            "curve_threshold_deg": _require_json_int(
+                raw_config.get("curve_threshold_deg"), "config.curve_threshold_deg", 2, 90
+            ),
+            "transition_extension_points": _require_json_int(
+                raw_config.get("transition_extension_points"),
+                "config.transition_extension_points",
+                0,
+                40,
+            ),
+        }
+        profiles = self._parse_profile_entries(payload.get("profiles"))
+        segments = self._parse_segment_entries(payload.get("segments"), point_count)
+        return config, profiles, segments
+
+    def _apply_plan_file_payload(
+        self,
+        config: dict,
+        profiles: dict[int, tuple[int, int, int, float, float, float]],
+        segments: list[tuple[int, int, int, int, int, int, float, float, float]],
+    ) -> None:
+        self._updating_table = True
+        try:
+            self.start_speed_input.setValue(config["start_speed_percent"])
+            self.line_loss_odometry_check.setChecked(config["line_loss_odometry_enabled"])
+            self.battery_compensation_check.setChecked(config["battery_compensation_enabled"])
+            self.auto_detect_check.setChecked(config["auto_detect_enabled"])
+            self.curve_threshold_input.setValue(config["curve_threshold_deg"])
+            self.transition_extension_input.setValue(config["transition_extension_points"])
+
+            for row, (segment_type, _label) in enumerate(PROFILE_ROWS):
+                for column, value in enumerate(profiles[segment_type]):
+                    text = f"{value:.{PID_DECIMALS}f}" if isinstance(value, float) else str(value)
+                    self.profile_table.setItem(row, column, QTableWidgetItem(text))
+
+            self.segment_table.setRowCount(0)
+            for segment in segments:
+                self._append_segment(segment)
+        finally:
+            self._updating_table = False
+
+        self._save_current_settings()
+        self._draw_map()
+
+    def _plan_file_start_path(self, default_name: str = "") -> str:
+        directory = self.settings.value("race_plan/file_directory", "", type=str)
+        if not directory:
+            return default_name
+        return str(Path(directory) / default_name) if default_name else directory
+
+    def _show_plan_file_error(self, title: str, message: str) -> None:
+        self.status_label.setText(message)
+        QMessageBox.warning(self, title, message)
+
+    def _save_plan_file(self) -> None:
+        try:
+            payload = self._build_plan_file_payload()
+        except (AttributeError, KeyError, TypeError, ValueError, OverflowError) as exc:
+            self._show_plan_file_error("Salvar plano", str(exc))
+            return
+
+        map_name = str(payload["map"].get("name", "plano_corrida"))
+        safe_name = "".join(character if character.isalnum() or character in "-_" else "_" for character in map_name)
+        safe_name = safe_name.strip("_") or "plano_corrida"
+        default_path = self._plan_file_start_path(f"{safe_name}_plano.json")
+        file_name, _selected_filter = QFileDialog.getSaveFileName(
+            self,
+            "Salvar plano de corrida",
+            default_path,
+            "Plano de corrida JSON (*.json);;Todos os arquivos (*)",
+        )
+        if not file_name:
+            return
+
+        path = Path(file_name)
+        if not path.suffix:
+            path = path.with_suffix(".json")
+        try:
+            serialized = json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False) + "\n"
+            path.write_text(serialized, encoding="utf-8")
+        except (OSError, UnicodeError, ValueError) as exc:
+            self._show_plan_file_error("Salvar plano", f"nao foi possivel salvar: {exc}")
+            return
+
+        self.settings.setValue("race_plan/file_directory", str(path.parent))
+        self._save_current_settings()
+        self.status_label.setText(f"plano salvo: {path.name}")
+
+    def _load_plan_file(self) -> None:
+        try:
+            self._loaded_map_context()
+        except (TypeError, ValueError) as exc:
+            self._show_plan_file_error("Carregar plano", str(exc))
+            return
+
+        file_name, _selected_filter = QFileDialog.getOpenFileName(
+            self,
+            "Carregar plano de corrida",
+            self._plan_file_start_path(),
+            "Plano de corrida JSON (*.json);;Todos os arquivos (*)",
+        )
+        if not file_name:
+            return
+
+        path = Path(file_name)
+        try:
+            if path.stat().st_size > 2 * 1024 * 1024:
+                raise ValueError("arquivo de plano excede 2 MiB")
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            config, profiles, segments = self._parse_plan_file_payload(payload)
+        except (OSError, UnicodeError, json.JSONDecodeError, KeyError, TypeError, ValueError, OverflowError) as exc:
+            self._show_plan_file_error("Carregar plano", f"arquivo invalido: {exc}")
+            return
+
+        self._apply_plan_file_payload(config, profiles, segments)
+        self.settings.setValue("race_plan/file_directory", str(path.parent))
+        self.status_label.setText(f"plano carregado: {path.name}")
 
     def _read_config(self) -> dict:
         return {
@@ -447,6 +831,27 @@ class RacePlanPanel(QWidget):
             return []
         segments.sort(key=lambda item: item[0])
         return segments
+
+    def _validated_current_segments(self) -> list[tuple[int, int, int, int, int, int, float, float, float]]:
+        _map_data, point_count = self._loaded_map_context()
+        segments = self._read_segments()
+        if not segments:
+            raise ValueError("plano sem segmentos ou com valor invalido")
+        payload = [
+            {
+                "start_index": start,
+                "end_index": end,
+                "type": segment_type,
+                "speed_percent": speed,
+                "max_speed_percent": max_speed,
+                "aux_percent": aux,
+                "kp": kp,
+                "ki": ki,
+                "kd": kd,
+            }
+            for start, end, segment_type, speed, max_speed, aux, kp, ki, kd in segments
+        ]
+        return self._parse_segment_entries(payload, point_count)
 
     def _segment_for_target(self, target_index: int) -> tuple[int, int, int, int, int, int, float, float, float] | None:
         for segment in self._read_segments():

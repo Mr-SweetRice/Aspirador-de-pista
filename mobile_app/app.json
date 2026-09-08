@@ -1,0 +1,42 @@
+{
+  "expo": {
+    "name": "Aspirador de Pista",
+    "slug": "aspirador-de-pista",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "dark",
+    "newArchEnabled": true,
+    "scheme": "aspiradordepista",
+    "ios": {
+      "supportsTablet": false,
+      "bundleIdentifier": "com.aspiradordepista.control",
+      "infoPlist": {
+        "NSBluetoothAlwaysUsageDescription": "O Bluetooth conecta o aplicativo ao robô Aspirador de Pista."
+      }
+    },
+    "android": {
+      "package": "com.aspiradordepista.control",
+      "permissions": [
+        "android.permission.BLUETOOTH_SCAN",
+        "android.permission.BLUETOOTH_CONNECT",
+        "android.permission.ACCESS_FINE_LOCATION"
+      ]
+    },
+    "plugins": [
+      [
+        "react-native-ble-plx",
+        {
+          "isBackgroundEnabled": false,
+          "neverForLocation": true,
+          "bluetoothAlwaysPermission": "Permitir que o Aspirador de Pista conecte ao robô por Bluetooth."
+        }
+      ],
+      "expo-secure-store"
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "configure-no-eas-init"
+      }
+    }
+  }
+}

@@ -14,14 +14,6 @@
 #define COMMS_COMMAND_UUID_STR "5d7a0002-8f5a-4a7d-9d4f-7a6c2b8d0001"
 #define COMMS_TELEMETRY_UUID_STR "5d7a0003-8f5a-4a7d-9d4f-7a6c2b8d0001"
 
-#define COMMS_IMU_FLAG_MAG_CALIBRATING (1U << 0)
-#define COMMS_IMU_FLAG_MAG_CALIBRATED (1U << 1)
-#define COMMS_IMU_FLAG_ACCEL_GYRO_CALIBRATING (1U << 2)
-#define COMMS_IMU_FLAG_ACCEL_GYRO_CALIBRATED (1U << 3)
-#define COMMS_IMU_FLAG_MAG_IGNORED (1U << 4)
-#define COMMS_IMU_FLAG_YAW_DRIFT_CALIBRATING (1U << 5)
-#define COMMS_IMU_FLAG_YAW_DRIFT_CALIBRATED (1U << 6)
-
 typedef enum {
     COMMS_CMD_CLASS_SAVE = 0x01,
     COMMS_CMD_CLASS_READ = 0x02,
@@ -55,6 +47,7 @@ typedef enum {
     COMMS_SEND_SET_LEFT_PWM = 0x10,
     COMMS_SEND_SET_RIGHT_PWM = 0x11,
     COMMS_SEND_SET_AUX_PWM = 0x12,
+    COMMS_SEND_SET_ZERO_BRAKE_ENABLED = 0x13,
     COMMS_SEND_RESET_ENCODERS = 0x20,
     COMMS_SEND_RESET_YAW = 0x21,
     COMMS_SEND_MAP_RECORD_START = 0x22,
@@ -86,6 +79,7 @@ typedef enum {
     COMMS_SEND_LINE_CALIBRATE = 0x50,
     COMMS_SEND_LINE_SET_TRACK_TYPE = 0x51,
     COMMS_SEND_LINE_SET_THRESHOLD = 0x52,
+    COMMS_SEND_LINE_SET_FILTER = 0x53,
     COMMS_SEND_RGB_LED_SET_ENABLED = 0x60,
     COMMS_SEND_RGB_LED_SET_MODE = 0x61,
     COMMS_SEND_RGB_LED_SET_MANUAL = 0x62,
@@ -96,7 +90,17 @@ typedef enum {
     COMMS_SEND_SAFETY_SET_LINE_LOSS_ENABLED = 0x74,
     COMMS_SEND_SAFETY_SET_LINE_LOSS_TIMEOUT = 0x75,
     COMMS_SEND_SAFETY_SET_BLE_LOSS_ENABLED = 0x76,
+    COMMS_SEND_SAFETY_SET_DISTANCE_LIMIT_ENABLED = 0x77,
+    COMMS_SEND_SAFETY_SET_DISTANCE_LIMIT = 0x78,
+    COMMS_SEND_SAFETY_RESET_DISTANCE = 0x79,
+    COMMS_SEND_PORTAL_SET_CONFIG = 0x80,
+    COMMS_SEND_TELEMETRY_SET_ENABLED = 0x81,
 } comms_send_id_t;
+
+typedef struct __attribute__((packed)) {
+    uint8_t message_id;
+    uint8_t enabled;
+} comms_telemetry_enable_payload_t;
 
 typedef enum {
     COMMS_TELE_STATUS = 0x01,
@@ -117,7 +121,29 @@ typedef enum {
     COMMS_TELE_RGB_LED = 0x31,
     COMMS_TELE_SAFETY = 0x32,
     COMMS_TELE_SYSTEM = 0x33,
+    COMMS_TELE_PORTAL = 0x34,
 } comms_telemetry_id_t;
+
+typedef struct __attribute__((packed)) {
+    uint8_t enabled;
+    uint16_t threshold_mm;
+    uint8_t stop_speed_percent;
+    uint16_t stop_delay_ms;
+} comms_portal_config_payload_t;
+
+typedef struct __attribute__((packed)) {
+    uint8_t enabled;
+    uint8_t sensor_ok;
+    uint8_t detected;
+    uint8_t count;
+    uint8_t stopping;
+    uint16_t distance_mm;
+    uint16_t threshold_mm;
+    uint8_t stop_speed_percent;
+    uint16_t stop_delay_ms;
+    uint8_t gpio1_active;
+    uint32_t gpio1_events;
+} comms_portal_telemetry_payload_t;
 
 typedef struct {
     uint8_t version;
@@ -204,6 +230,7 @@ typedef struct __attribute__((packed)) {
     uint8_t race_segment_aux_percent;
     uint8_t active_speed_percent;
     float race_plan_average_speed_mps;
+    float line_alpha;
 } comms_control_telemetry_payload_t;
 
 typedef struct __attribute__((packed)) {
@@ -234,6 +261,7 @@ typedef struct __attribute__((packed)) {
     uint8_t flags;
     uint8_t threshold_percent;
     float read_hz;
+    uint8_t filter_percent;
 } comms_line_telemetry_payload_t;
 
 typedef struct __attribute__((packed)) {
@@ -242,17 +270,14 @@ typedef struct __attribute__((packed)) {
     uint8_t flags;
     uint8_t threshold_percent;
     float read_hz;
+    uint8_t filter_percent;
 } comms_line_fast_telemetry_payload_t;
 
 typedef struct __attribute__((packed)) {
     float roll_deg;
     float pitch_deg;
     float yaw_deg;
-    float gyro_z_dps;
-    float sample_hz;
-    uint8_t mag_heading_mode;
-    uint8_t flags;
-} comms_imu_fast_telemetry_payload_t;
+} comms_imu_telemetry_payload_t;
 
 typedef struct __attribute__((packed)) {
     uint8_t mode;
@@ -271,31 +296,16 @@ typedef struct __attribute__((packed)) {
     float current_battery_percent;
     float line_loss_timeout_s;
     float line_loss_elapsed_s;
+    float distance_limit_m;
+    float distance_traveled_m;
 } comms_safety_telemetry_payload_t;
 
 typedef struct __attribute__((packed)) {
     float cpu0_percent;
     float cpu1_percent;
+    uint8_t flags;
 } comms_system_telemetry_payload_t;
 
-typedef struct __attribute__((packed)) {
-    float roll_deg;
-    float pitch_deg;
-    float yaw_deg;
-    float mag_yaw_deg;
-    float mag_yaw_xy_deg;
-    float mag_yaw_xz_deg;
-    float mag_yaw_yz_deg;
-    float mag_yaw_error_deg;
-    float mag_field_norm_ut;
-    float mag_filter_gain;
-    float yaw_drift_threshold_dps;
-    float quat_wxyz[4];
-    float accel_mps2[3];
-    float gyro_dps[3];
-    float mag_ut[3];
-    uint8_t mag_heading_mode;
-    uint8_t flags;
-} comms_imu_telemetry_payload_t;
+#define COMMS_SYSTEM_FLAG_ZERO_BRAKE_ENABLED (1U << 0)
 
 #endif

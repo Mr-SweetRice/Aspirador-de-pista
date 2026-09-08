@@ -7,7 +7,7 @@ from typing import Any
 import numpy as np
 import pyqtgraph.opengl as gl
 from PySide6.QtCore import QTimer, Signal
-from PySide6.QtGui import QMatrix4x4, QQuaternion, QVector3D
+from PySide6.QtGui import QMatrix4x4, QVector3D
 from PySide6.QtWidgets import QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget
 
 from telemetry.state import RobotState
@@ -34,7 +34,6 @@ class Robot3DView(QWidget):
         self._roll = 0.0
         self._pitch = 0.0
         self._yaw = 0.0
-        self._quaternion = (1.0, 0.0, 0.0, 0.0)
         self._model_error = ""
         self._model_loading = False
 
@@ -89,27 +88,24 @@ class Robot3DView(QWidget):
         self._roll = state.roll
         self._pitch = state.pitch
         self._yaw = state.yaw
-        self._quaternion = state.quaternion
         if self.ignore_mag_button.isChecked() != state.mag_ignored:
             self.ignore_mag_button.blockSignals(True)
             self.ignore_mag_button.setChecked(state.mag_ignored)
             self.ignore_mag_button.blockSignals(False)
 
         if self.model_items:
-            quat = QQuaternion(
-                float(self._quaternion[0]),
-                float(self._quaternion[1]),
-                float(self._quaternion[2]),
-                float(self._quaternion[3]),
-            ).normalized()
             matrix = QMatrix4x4()
-            matrix.rotate(quat)
+            matrix.rotate(self._yaw, QVector3D(0, 0, 1))
+            matrix.rotate(self._pitch, QVector3D(0, 1, 0))
+            matrix.rotate(self._roll, QVector3D(1, 0, 0))
             matrix.rotate(MODEL_PITCH_OFFSET_DEG, QVector3D(1, 0, 0))
             for item in self.model_items:
                 item.setTransform(matrix)
 
             self.status.setText(
-                f"GLB: {self.model_path.name if self.model_path else 'modelo'} | q {self._quaternion[0]:.3f}, {self._quaternion[1]:.3f}, {self._quaternion[2]:.3f}, {self._quaternion[3]:.3f} | pitch offset {MODEL_PITCH_OFFSET_DEG:.0f}"
+                f"GLB: {self.model_path.name if self.model_path else 'modelo'} | "
+                f"roll {self._roll:.1f} | pitch {self._pitch:.1f} | yaw {self._yaw:.1f} | "
+                f"pitch offset {MODEL_PITCH_OFFSET_DEG:.0f}"
             )
         elif self._model_error:
             self.status.setText(self._model_error)

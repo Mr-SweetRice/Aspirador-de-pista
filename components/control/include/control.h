@@ -68,6 +68,7 @@ typedef struct {
     float kp;
     float ki;
     float kd;
+    float line_alpha;
     uint8_t motor_limit_percent;
     float loop_hz;
     float race_plan_loop_hz;
@@ -99,10 +100,12 @@ esp_err_t control_stop_all(void);
 esp_err_t control_emergency_stop(void);
 esp_err_t control_start_map(uint8_t map_slot, int8_t speed_percent);
 esp_err_t control_start_line(int8_t speed_percent);
-esp_err_t control_start_auto_track(uint8_t map_slot, int8_t speed_percent);
+esp_err_t control_start_auto_track(uint8_t map_slot, int8_t speed_percent, bool use_race_plan);
 esp_err_t control_stop_navigation(void);
 esp_err_t control_set_pid(float kp, float ki, float kd);
 esp_err_t control_save_pid_settings(float kp, float ki, float kd, uint8_t limit_percent, uint8_t aux_percent);
+esp_err_t control_set_line_alpha(float alpha);
+esp_err_t control_save_line_alpha(float alpha);
 esp_err_t control_set_speed_profile(const control_speed_profile_point_t *points, size_t count);
 esp_err_t control_set_speed_profile_enabled(bool enabled);
 esp_err_t control_set_battery_compensation_enabled(bool enabled);
@@ -110,6 +113,8 @@ esp_err_t control_set_auto_track_config(const control_auto_track_config_t *confi
 esp_err_t control_set_race_plan(const control_race_plan_segment_t *segments, size_t count, bool enabled);
 esp_err_t control_set_motor_limit(uint8_t limit_percent);
 esp_err_t control_set_aux_percent(uint8_t aux_percent);
+esp_err_t control_begin_portal_stop(uint8_t speed_percent);
+esp_err_t control_set_mapping_mode(bool enabled);
 bool control_get_navigation_state(control_navigation_state_t *out_state);
 
 #endif

@@ -25,30 +25,12 @@ class RobotState:
     battery_raw: int = 0
     cpu0_percent: float = 0.0
     cpu1_percent: float = 0.0
+    zero_brake_enabled: bool = True
 
     roll: float = 0.0
     pitch: float = 0.0
     yaw: float = 0.0
-    mag_yaw: float = 0.0
-    mag_yaw_xy: float = 0.0
-    mag_yaw_xz: float = 0.0
-    mag_yaw_yz: float = 0.0
-    mag_yaw_error: float = 0.0
-    mag_norm: float = 0.0
-    mag_filter_gain: float = 0.0
-    yaw_drift_threshold: float = 0.05
-    mag_heading_mode: int = 1
-    quaternion: tuple[float, float, float, float] = (1.0, 0.0, 0.0, 0.0)
-    accel: tuple[float, float, float] = (0.0, 0.0, 0.0)
-    gyro: tuple[float, float, float] = (0.0, 0.0, 0.0)
-    mag: tuple[float, float, float] = (0.0, 0.0, 0.0)
     mag_ignored: bool = False
-    mag_calibrating: bool = False
-    mag_calibrated: bool = False
-    accel_gyro_calibrating: bool = False
-    accel_gyro_calibrated: bool = False
-    yaw_drift_calibrating: bool = False
-    yaw_drift_calibrated: bool = False
 
     x_m: float = 0.0
     y_m: float = 0.0
@@ -80,6 +62,7 @@ class RobotState:
     control_kp: float = 35.0
     control_ki: float = 0.0
     control_kd: float = 0.0
+    control_line_alpha: float = 0.7
     control_motor_limit_percent: int = 100
     control_loop_hz: float = 0.0
     race_plan_loop_hz: float = 0.0
@@ -114,6 +97,7 @@ class RobotState:
     line_calibrated_valid: bool = False
     line_calibrating: bool = False
     line_threshold_percent: int = 0
+    line_filter_percent: int = 100
     line_read_hz: float = 0.0
 
     rgb_led_mode: int = 1
@@ -127,10 +111,12 @@ class RobotState:
     safety_battery_block_enabled: bool = True
     safety_line_loss_enabled: bool = True
     safety_ble_loss_enabled: bool = True
+    safety_distance_limit_enabled: bool = False
     safety_collision_active: bool = False
     safety_battery_block_active: bool = False
     safety_line_loss_active: bool = False
     safety_ble_loss_active: bool = False
+    safety_distance_limit_active: bool = False
     safety_motors_blocked: bool = False
     safety_line_visible: bool = False
     safety_ble_connected: bool = False
@@ -140,6 +126,21 @@ class RobotState:
     safety_line_loss_elapsed_s: float = 0.0
     safety_current_roll_deg: float = 0.0
     safety_current_battery_percent: float = 0.0
+    safety_distance_limit_m: float = 1.0
+    safety_distance_traveled_m: float = 0.0
+
+    portal_enabled: bool = False
+    portal_sensor_ok: bool = False
+    portal_detected: bool = False
+    portal_count: int = 0
+    portal_stopping: bool = False
+    portal_gpio1_available: bool = False
+    portal_gpio1_active: bool = False
+    portal_gpio1_events: int = 0
+    portal_distance_mm: int = 0
+    portal_threshold_mm: int = 300
+    portal_stop_speed_percent: int = 20
+    portal_stop_delay_ms: int = 500
 
     samples: int = 0
     time_s: list[float] = field(default_factory=list)
@@ -154,6 +155,19 @@ class RobotState:
 
     def update(self, sample: dict) -> None:
         self.samples += 1
+        self.portal_enabled = bool(sample.get("portal_enabled", self.portal_enabled))
+        self.portal_sensor_ok = bool(sample.get("portal_sensor_ok", self.portal_sensor_ok))
+        self.portal_detected = bool(sample.get("portal_detected", self.portal_detected))
+        self.portal_count = int(sample.get("portal_count", self.portal_count))
+        self.portal_stopping = bool(sample.get("portal_stopping", self.portal_stopping))
+        if "portal_gpio1_active" in sample:
+            self.portal_gpio1_available = True
+        self.portal_gpio1_active = bool(sample.get("portal_gpio1_active", self.portal_gpio1_active))
+        self.portal_gpio1_events = int(sample.get("portal_gpio1_events", self.portal_gpio1_events))
+        self.portal_distance_mm = int(sample.get("portal_distance_mm", self.portal_distance_mm))
+        self.portal_threshold_mm = int(sample.get("portal_threshold_mm", self.portal_threshold_mm))
+        self.portal_stop_speed_percent = int(sample.get("portal_stop_speed_percent", self.portal_stop_speed_percent))
+        self.portal_stop_delay_ms = int(sample.get("portal_stop_delay_ms", self.portal_stop_delay_ms))
         self.left_encoder = int(sample.get("left_encoder", self.left_encoder))
         self.right_encoder = int(sample.get("right_encoder", self.right_encoder))
         self.left_rpm = float(sample.get("left_rpm", self.left_rpm))
@@ -164,31 +178,11 @@ class RobotState:
         self.battery_raw = int(sample.get("battery_raw", self.battery_raw))
         self.cpu0_percent = float(sample.get("cpu0_percent", self.cpu0_percent))
         self.cpu1_percent = float(sample.get("cpu1_percent", self.cpu1_percent))
+        self.zero_brake_enabled = bool(sample.get("zero_brake_enabled", self.zero_brake_enabled))
         self.roll = float(sample.get("roll", self.roll))
         self.pitch = float(sample.get("pitch", self.pitch))
         self.yaw = float(sample.get("yaw", self.yaw))
-        self.mag_yaw = float(sample.get("mag_yaw", self.mag_yaw))
-        self.mag_yaw_xy = float(sample.get("mag_yaw_xy", self.mag_yaw_xy))
-        self.mag_yaw_xz = float(sample.get("mag_yaw_xz", self.mag_yaw_xz))
-        self.mag_yaw_yz = float(sample.get("mag_yaw_yz", self.mag_yaw_yz))
-        self.mag_yaw_error = float(sample.get("mag_yaw_error", self.mag_yaw_error))
-        self.mag_norm = float(sample.get("mag_norm", self.mag_norm))
-        self.mag_filter_gain = float(sample.get("mag_filter_gain", self.mag_filter_gain))
-        self.yaw_drift_threshold = float(sample.get("yaw_drift_threshold", self.yaw_drift_threshold))
-        self.mag_heading_mode = int(sample.get("mag_heading_mode", self.mag_heading_mode))
-        self.quaternion = tuple(sample.get("quaternion", self.quaternion))
-        self.accel = tuple(sample.get("accel", self.accel))
-        self.gyro = tuple(sample.get("gyro", self.gyro))
-        if "gyro_z_dps" in sample and len(self.gyro) >= 3:
-            self.gyro = (self.gyro[0], self.gyro[1], float(sample["gyro_z_dps"]))
-        self.mag = tuple(sample.get("mag", self.mag))
         self.mag_ignored = bool(sample.get("mag_ignored", self.mag_ignored))
-        self.mag_calibrating = bool(sample.get("mag_calibrating", self.mag_calibrating))
-        self.mag_calibrated = bool(sample.get("mag_calibrated", self.mag_calibrated))
-        self.accel_gyro_calibrating = bool(sample.get("accel_gyro_calibrating", self.accel_gyro_calibrating))
-        self.accel_gyro_calibrated = bool(sample.get("accel_gyro_calibrated", self.accel_gyro_calibrated))
-        self.yaw_drift_calibrating = bool(sample.get("yaw_drift_calibrating", self.yaw_drift_calibrating))
-        self.yaw_drift_calibrated = bool(sample.get("yaw_drift_calibrated", self.yaw_drift_calibrated))
         self.x_m = float(sample.get("x_m", self.x_m))
         self.y_m = float(sample.get("y_m", self.y_m))
         self.heading_rad = float(sample.get("heading_rad", self.heading_rad))
@@ -220,6 +214,7 @@ class RobotState:
         self.control_kp = float(sample.get("control_kp", self.control_kp))
         self.control_ki = float(sample.get("control_ki", self.control_ki))
         self.control_kd = float(sample.get("control_kd", self.control_kd))
+        self.control_line_alpha = float(sample.get("control_line_alpha", self.control_line_alpha))
         self.control_motor_limit_percent = int(sample.get("control_motor_limit_percent", self.control_motor_limit_percent))
         self.control_loop_hz = float(sample.get("control_loop_hz", self.control_loop_hz))
         self.race_plan_loop_hz = float(sample.get("race_plan_loop_hz", self.race_plan_loop_hz))
@@ -277,6 +272,7 @@ class RobotState:
         self.line_calibrated_valid = bool(sample.get("line_calibrated_valid", self.line_calibrated_valid))
         self.line_calibrating = bool(sample.get("line_calibrating", self.line_calibrating))
         self.line_threshold_percent = int(sample.get("line_threshold_percent", self.line_threshold_percent))
+        self.line_filter_percent = int(sample.get("line_filter_percent", self.line_filter_percent))
         self.line_read_hz = float(sample.get("line_read_hz", self.line_read_hz))
         if "line_sensor_loop_hz" not in sample and "line_read_hz" in sample:
             self.line_sensor_loop_hz = self.line_read_hz
@@ -294,12 +290,18 @@ class RobotState:
         )
         self.safety_line_loss_enabled = bool(sample.get("safety_line_loss_enabled", self.safety_line_loss_enabled))
         self.safety_ble_loss_enabled = bool(sample.get("safety_ble_loss_enabled", self.safety_ble_loss_enabled))
+        self.safety_distance_limit_enabled = bool(
+            sample.get("safety_distance_limit_enabled", self.safety_distance_limit_enabled)
+        )
         self.safety_collision_active = bool(sample.get("safety_collision_active", self.safety_collision_active))
         self.safety_battery_block_active = bool(
             sample.get("safety_battery_block_active", self.safety_battery_block_active)
         )
         self.safety_line_loss_active = bool(sample.get("safety_line_loss_active", self.safety_line_loss_active))
         self.safety_ble_loss_active = bool(sample.get("safety_ble_loss_active", self.safety_ble_loss_active))
+        self.safety_distance_limit_active = bool(
+            sample.get("safety_distance_limit_active", self.safety_distance_limit_active)
+        )
         self.safety_motors_blocked = bool(sample.get("safety_motors_blocked", self.safety_motors_blocked))
         self.safety_line_visible = bool(sample.get("safety_line_visible", self.safety_line_visible))
         self.safety_ble_connected = bool(sample.get("safety_ble_connected", self.safety_ble_connected))
@@ -316,6 +318,12 @@ class RobotState:
         self.safety_current_roll_deg = float(sample.get("safety_current_roll_deg", self.safety_current_roll_deg))
         self.safety_current_battery_percent = float(
             sample.get("safety_current_battery_percent", self.safety_current_battery_percent)
+        )
+        self.safety_distance_limit_m = float(
+            sample.get("safety_distance_limit_m", self.safety_distance_limit_m)
+        )
+        self.safety_distance_traveled_m = float(
+            sample.get("safety_distance_traveled_m", self.safety_distance_traveled_m)
         )
 
         t = time()

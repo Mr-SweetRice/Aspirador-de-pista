@@ -5,6 +5,7 @@
 #include <stdint.h>
 
 #include "esp_err.h"
+#include "driver/i2c_master.h"
 
 typedef struct {
     float accel_mps2[3];
@@ -48,5 +49,8 @@ esp_err_t imu_set_yaw_drift_threshold(float threshold_dps);
 float imu_get_yaw_drift_threshold(void);
 esp_err_t imu_reset_yaw(void);
 bool imu_get_state(imu_state_t *out_state);
+i2c_master_bus_handle_t imu_get_i2c_bus(void);
+bool imu_i2c_lock(uint32_t timeout_ms);
+void imu_i2c_unlock(void);
 
 #endif
