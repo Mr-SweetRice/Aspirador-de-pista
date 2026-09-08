@@ -2,7 +2,7 @@
 
 Este documento descreve os materiais e as ligações elétricas atualmente refletidos no firmware. Ele serve como referência para montagem, manutenção e publicação do projeto no GitHub.
 
-> **Atenção:** o motor especificado é o **GA12-N30 6 V**. Ele deve ser alimentado pela tensão do conjunto de potência (aproximadamente 6 V), através do driver TB6612FNG. Nunca ligue o motor diretamente a um GPIO do ESP32-S3.
+> **Atenção:** os motores **GA12-N30 são nominais de 6 V**, mas nesta montagem o `VM` do TB6612FNG recebe diretamente a bateria 3S (até 12,6 V carregada). O PWM deve limitar a potência aplicada aos motores. Nunca ligue um motor diretamente a um GPIO do ESP32-S3.
 
 ## Materiais
 
@@ -35,8 +35,7 @@ flowchart LR
     BAT[(Bateria)] --> FUS[Fusível / chave geral]
     FUS --> VBAT[Alimentação da bateria\n3S: 9,0–12,6 V]
     FUS --> REG[Mini-360\nsaída ajustada em 5 V]
-    FUS --> MREG[Alimentação regulada dos GA12\n6 V, circuito a confirmar]
-    MREG --> VM[Barramento dos motores\n6 V]
+    FUS --> VM[VM do TB6612FNG\nbateria 3S direta]
     REG --> V5[5 V: turbina e periféricos]
     V5 --> VCC[Regulador da DevKit\n3,3 V lógica]
 
@@ -100,7 +99,7 @@ Configuração atual: PWM em 25 kHz, resolução de 10 bits, quadratura 4x e amo
 
 | TB6612FNG | Conectar em |
 |---|---|
-| `VM` | Barramento regulado compatível com os motores GA12-N30 de 6 V; não usar diretamente a bateria 3S |
+| `VM` | Positivo da bateria 3S, ligado diretamente ao barramento de potência do TB6612FNG |
 | `VCC` | 3,3 V da lógica |
 | `GND` | GND comum |
 | `A01/A02` | Motor GA12-N30 esquerdo |
@@ -110,6 +109,8 @@ Configuração atual: PWM em 25 kHz, resolução de 10 bits, quadratura 4x e amo
 | `STBY` | GPIO 36; deve estar em nível alto para habilitar o driver |
 
 Coloque um capacitor de baixa impedância próximo de `VM/GND` do driver e, se os cabos dos motores forem longos, capacitores de supressão nos terminais dos motores. Verifique a corrente de travamento do GA12-N30 antes de escolher o fusível e confirme que ela está dentro do limite do TB6612FNG.
+
+Como os GA12-N30 são de 6 V e o barramento pode chegar a 12,6 V, não use 100% de PWM continuamente sem validar temperatura, corrente e rotação. Como referência inicial, 6 V correspondem a aproximadamente 48% de duty com a bateria totalmente carregada e 54% com a bateria em 11,1 V nominal. A carga do motor, as perdas da ponte e o comportamento do controle também influenciam a tensão efetiva. O firmware atualmente permite limite de até 100%, portanto esse limite deve ser configurado conscientemente no Painel de Controle do Robô.
 
 ### Circuito da turbina
 
@@ -149,4 +150,4 @@ Se o encoder instalado tiver outra resolução ou redução, ajuste `components/
 
 ## Itens que precisam ser confirmados na montagem física
 
-Para transformar este documento em um esquema elétrico definitivo, ainda faltam o modelo específico do QTR/VL53L0X e a confirmação de como os GA12-N30 de 6 V serão alimentados. A bateria 3S não deve ser aplicada diretamente aos motores de 6 V sem uma etapa de alimentação compatível. Esses itens podem alterar conectores e limites de corrente, embora não mudem a pinagem de firmware documentada acima.
+Para transformar este documento em um esquema elétrico definitivo, ainda faltam os modelos específicos do QTR e do módulo VL53L0X. A alimentação dos GA12-N30 já está definida como bateria 3S diretamente no `VM` do TB6612FNG, com potência controlada por PWM.

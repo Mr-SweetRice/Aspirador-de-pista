@@ -21,7 +21,7 @@ Firmware ESP-IDF para o ESP32-S3-DevKitC-1, responsável pelo controle de um rob
 
 Materiais, esquemático funcional, pinagem, ligações do TB6612FNG e checklist de montagem: [docs/HARDWARE.md](docs/HARDWARE.md).
 
-Resumo da alimentação: bateria LiPo 3S de 300 mAh, Mini-360 ajustado para 5 V e divisor de bateria de 10 kΩ/1 kΩ. A turbina usa um motor **8520 nominal de 7,4 V**, operado em 5 V, com pull-down de 10 kΩ no controle e diodo 1N4148 em paralelo com o motor. Consulte [docs/HARDWARE.md](docs/HARDWARE.md).
+Resumo da alimentação: bateria LiPo 3S de 300 mAh ligada diretamente ao `VM` do TB6612FNG; os GA12-N30 são nominais de 6 V e têm a potência controlada por PWM. O Mini-360 é ajustado para 5 V e o divisor da bateria usa 10 kΩ/1 kΩ. A turbina usa um motor **8520 nominal de 7,4 V**, operado em 5 V, com pull-down de 10 kΩ no controle e diodo 1N4148 em paralelo com o motor. Consulte [docs/HARDWARE.md](docs/HARDWARE.md).
 
 ## Requisitos
 
