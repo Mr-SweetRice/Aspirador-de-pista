@@ -1,6 +1,6 @@
 # Aspirador de Pista
 
-Firmware ESP-IDF para ESP32-S3 com arquitetura modular para controle e telemetria de um robo de pista. A base atual limpa o firmware antigo e mantem apenas configuracoes, pinagem e comunicacao BLE inicial.
+Firmware ESP-IDF para o ESP32-S3-DevKitC-1, responsável pelo controle de um robô de pista, motores GA12-N30, turbina, sensores, odometria e telemetria BLE.
 
 ## Estrutura
 
@@ -13,10 +13,15 @@ Firmware ESP-IDF para ESP32-S3 com arquitetura modular para controle e telemetri
 - `components/odometry`: configuracoes basicas de odometria.
 - `components/imu`: configuracao I2C do MPU-9250.
 - `components/memory`: configuracao base de NVS.
+- `components/portal_sensor` e `components/vl53l0x_driver`: sensor de portal/distância VL53L0X.
+- `engineering_ui/`: interface de controle, mapas, gráficos e configuração da telemetria.
+- `mobile_app/`: aplicativo móvel BLE.
 
 ## Documentação de hardware
 
 Materiais, esquemático funcional, pinagem, ligações do TB6612FNG e checklist de montagem: [docs/HARDWARE.md](docs/HARDWARE.md).
+
+Resumo da alimentação: bateria LiPo 3S de 300 mAh, Mini-360 ajustado para 5 V e divisor de bateria de 10 kΩ/1 kΩ. O circuito da turbina usa pull-down de 10 kΩ no controle e diodo 1N4148 em paralelo com o motor. Consulte [docs/HARDWARE.md](docs/HARDWARE.md).
 
 ## Requisitos
 
@@ -82,7 +87,7 @@ Para sair do monitor:
 Ctrl + ]
 ```
 
-## BLE atual
+## Comunicação BLE
 
 O firmware atual inicia um servidor BLE NimBLE.
 
@@ -93,7 +98,7 @@ O firmware atual inicia um servidor BLE NimBLE.
 - Telemetry characteristic: `5d7a0003-8f5a-4a7d-9d4f-7a6c2b8d0001`
 - Token inicial: `engineering-token`
 
-Antes de enviar comandos, escreva o token na characteristic de autenticacao.
+Antes de enviar comandos, escreva o token na characteristic de autenticação. A fila BLE prioriza STOP, serializa as escritas ATT e reduz leituras concorrentes para evitar atrasos e perdas. A aba **Telemetria BLE** permite habilitar ou desabilitar cada pacote periódico.
 
 ## Protocolo binario inicial
 
@@ -128,24 +133,24 @@ Exemplo de pacote `SEND STOP` sem payload:
 01 03 01 00
 ```
 
-Neste momento os comandos sao recebidos e validados, mas ainda nao executam controle real dos motores. A ligacao com `control`, `memory` e telemetria sera feita nas proximas etapas.
+Os comandos são processados por uma tarefa dedicada, com STOP priorizado. A odometria interna permanece em 1000 Hz; somente a frequência de transmissão BLE é configurável.
 
 ## Configuracao de motores e encoders
 
 Os pinos dos motores ficam em `components/motors/include/motors_config.h`.
 
-- Esquerdo: `PWMA GPIO1`, `AIN1 GPIO2`, `AIN2 GPIO42`, encoder `GPIO21/GPIO47`.
-- Direito: `PWMB GPIO39`, `BIN1 GPIO41`, `BIN2 GPIO40`, encoder `GPIO48/GPIO35`.
-- Auxiliar: PWM via SI2300 em `GPIO4`, sem direcao e sem encoder.
+- Esquerdo: `PWMA GPIO39`, `AIN1 GPIO40`, `AIN2 GPIO41`, encoder `GPIO35/GPIO14`.
+- Direito: `PWMB GPIO1`, `BIN1 GPIO2`, `BIN2 GPIO42`, encoder `GPIO21/GPIO5`.
+- Turbina: PWM via SI2300 em `GPIO4`, sem direção e sem encoder.
 - Driver principal: `TB6612FNG`, `STBY GPIO36`.
 - PWM: LEDC low speed, timer 0, 10 bits, `25 kHz`, canais 0/1/2.
 
 Os encoders ficam em `components/encoder/include/encoder_config.h`.
 
-- Contagens por volta do motor: `44`.
-- Reducao: `10:1`.
+- Contagens por volta do motor: `11`.
+- Redução: `6:1`.
 - Multiplicador quadratura: `4x`.
-- Contagens por volta de saida: `44 * 10 * 4 = 1760`.
+- Contagens por volta de saída: `11 * 6 * 4 = 264`.
 
 A odometria usa esses parametros por `components/odometry/include/odometry_config.h`.
 
@@ -153,4 +158,5 @@ A odometria usa esses parametros por `components/odometry/include/odometry_confi
 
 - O `sdkconfig` esta com Bluetooth/NimBLE habilitado.
 - O arquivo `sdkconfig.defaults` tambem guarda as opcoes principais de BLE para futuras reconfiguracoes.
-- Os componentes sem logica final foram deixados minimos de proposito.
+- Firmware compilado com ESP-IDF e testes da interface Python executados com sucesso.
+- Confirme alimentação, polaridade e pinagem antes de energizar os motores.
