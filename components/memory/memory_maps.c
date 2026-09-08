@@ -2,12 +2,14 @@
 
 #include <math.h>
 #include <stddef.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "nvs.h"
 #include "odometry.h"
 
@@ -15,6 +17,10 @@
 #define MAP_INDEX_KEY "map_idx"
 #define MAP_RECORD_MIN_STEP_M 0.02f
 #define MAP_RECORD_MAX_STEP_M 0.30f
+#define MAP_RECORD_50M_REQUIRED_POINTS 2501
+
+_Static_assert(MEMORY_MAP_MAX_POINTS >= MAP_RECORD_50M_REQUIRED_POINTS,
+               "O buffer de mapa deve comportar pelo menos 50 m com passos de 2 cm");
 
 typedef struct __attribute__((packed)) {
     uint32_t magic;
@@ -27,6 +33,14 @@ typedef struct __attribute__((packed)) {
     uint8_t used[MEMORY_MAP_MAX_COUNT];
     char names[MEMORY_MAP_MAX_COUNT][MEMORY_MAP_NAME_MAX_LEN + 1];
 } map_index_t;
+
+/* Read cache is used by map transfer/start, never by the 1 kHz integration loop. */
+static stored_map_t read_cache;
+static bool read_cache_valid;
+static uint8_t read_cache_slot;
+static unsigned read_cache_revision;
+static atomic_uint maps_revision;
+static SemaphoreHandle_t read_cache_mutex;
 
 static const char *TAG = "memory_maps";
 static portMUX_TYPE record_mux = portMUX_INITIALIZER_UNLOCKED;
@@ -63,6 +77,7 @@ static esp_err_t save_index(nvs_handle_t handle, const map_index_t *index)
     if (ret == ESP_OK) {
         ret = nvs_commit(handle);
     }
+    atomic_fetch_add(&maps_revision, 1);
     return ret;
 }
 
@@ -124,6 +139,10 @@ static void sanitize_map_name(const char *name, char *out_name, size_t out_name_
 
 esp_err_t memory_maps_init(void)
 {
+    if (read_cache_mutex == NULL) {
+        read_cache_mutex = xSemaphoreCreateMutex();
+        if (read_cache_mutex == NULL) return ESP_ERR_NO_MEM;
+    }
     nvs_handle_t handle;
     esp_err_t ret = nvs_open(MEMORY_NVS_NAMESPACE, NVS_READWRITE, &handle);
     if (ret != ESP_OK) {
@@ -416,45 +435,45 @@ esp_err_t memory_maps_load_chunk(uint8_t slot,
                                  uint16_t *out_total_points,
                                  uint8_t *out_point_count)
 {
-    if (slot >= MEMORY_MAP_MAX_COUNT || points == NULL || out_total_points == NULL || out_point_count == NULL) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    nvs_handle_t handle;
-    esp_err_t ret = nvs_open(MEMORY_NVS_NAMESPACE, NVS_READONLY, &handle);
-    if (ret != ESP_OK) {
-        return ret;
-    }
-
-    stored_map_t *map = calloc(1, sizeof(stored_map_t));
-    if (map == NULL) {
+    if (slot >= MEMORY_MAP_MAX_COUNT || points == NULL || max_points == 0 ||
+        out_total_points == NULL || out_point_count == NULL) return ESP_ERR_INVALID_ARG;
+    if (read_cache_mutex == NULL) return ESP_ERR_INVALID_STATE;
+    xSemaphoreTake(read_cache_mutex, portMAX_DELAY);
+    esp_err_t ret = ESP_OK;
+    const unsigned revision = atomic_load(&maps_revision);
+    if (!read_cache_valid || read_cache_slot != slot || read_cache_revision != revision) {
+        read_cache_valid = false;
+        nvs_handle_t handle;
+        ret = nvs_open(MEMORY_NVS_NAMESPACE, NVS_READONLY, &handle);
+        if (ret != ESP_OK) goto done;
+        size_t len = sizeof(read_cache);
+        char key[8];
+        map_key(slot, key, sizeof(key));
+        ret = nvs_get_blob(handle, key, &read_cache, &len);
         nvs_close(handle);
-        return ESP_ERR_NO_MEM;
+        if (ret != ESP_OK) goto done;
+        if (len < offsetof(stored_map_t, points) || read_cache.magic != MAP_MAGIC ||
+            read_cache.point_count > MEMORY_MAP_MAX_POINTS ||
+            len < offsetof(stored_map_t, points) + read_cache.point_count * sizeof(memory_map_point_t)) {
+            ret = ESP_ERR_INVALID_SIZE;
+            goto done;
+        }
+        read_cache_slot = slot;
+        read_cache_revision = revision;
+        read_cache_valid = true;
     }
-    size_t len = sizeof(*map);
-    char key[8];
-    map_key(slot, key, sizeof(key));
-    ret = nvs_get_blob(handle, key, map, &len);
-    nvs_close(handle);
-    if (ret != ESP_OK) {
-        free(map);
-        return ret;
+    if (offset > read_cache.point_count) {
+        ret = ESP_ERR_INVALID_SIZE;
+        goto done;
     }
-    if (len < offsetof(stored_map_t, points) || map->magic != MAP_MAGIC ||
-        map->point_count > MEMORY_MAP_MAX_POINTS ||
-        len < offsetof(stored_map_t, points) + (map->point_count * sizeof(memory_map_point_t)) ||
-        offset > map->point_count) {
-        free(map);
-        return ESP_ERR_INVALID_SIZE;
-    }
-
-    uint16_t remaining = map->point_count - offset;
-    uint8_t count = remaining > max_points ? max_points : (uint8_t)remaining;
-    memcpy(points, &map->points[offset], count * sizeof(memory_map_point_t));
-    *out_total_points = map->point_count;
+    const uint16_t remaining = read_cache.point_count - offset;
+    const uint8_t count = remaining > max_points ? max_points : (uint8_t)remaining;
+    memcpy(points, &read_cache.points[offset], count * sizeof(memory_map_point_t));
+    *out_total_points = read_cache.point_count;
     *out_point_count = count;
-    free(map);
-    return ESP_OK;
+done:
+    xSemaphoreGive(read_cache_mutex);
+    return ret;
 }
 
 esp_err_t memory_maps_record_start(const char *name)

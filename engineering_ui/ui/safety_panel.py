@@ -7,6 +7,8 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QGroupBox,
     QLabel,
+    QPushButton,
+    QScrollArea,
     QVBoxLayout,
     QWidget,
 )
@@ -22,12 +24,25 @@ class SafetyPanel(QWidget):
     roll_limit_requested = Signal(float)
     battery_block_percent_requested = Signal(float)
     line_loss_timeout_requested = Signal(float)
+    distance_limit_enabled_requested = Signal(bool)
+    distance_limit_requested = Signal(float)
+    distance_reset_requested = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._updating = False
 
-        root = QVBoxLayout(self)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setFrameShape(QScrollArea.NoFrame)
+        self.scroll_content = QWidget()
+        self.scroll.setWidget(self.scroll_content)
+        outer.addWidget(self.scroll)
+
+        root = QVBoxLayout(self.scroll_content)
         root.setContentsMargins(10, 10, 10, 10)
         root.setSpacing(10)
 
@@ -80,6 +95,22 @@ class SafetyPanel(QWidget):
         ble_layout.addRow(self.ble_loss_enabled_check)
         root.addWidget(ble_group)
 
+        distance_group = QGroupBox("Parada por distancia dos encoders")
+        distance_layout = QFormLayout(distance_group)
+        distance_layout.setContentsMargins(16, 20, 16, 14)
+        self.distance_limit_enabled_check = QCheckBox("Parar com freio ao atingir a distancia")
+        self.distance_limit_input = QDoubleSpinBox()
+        self.distance_limit_input.setRange(0.01, 1000.0)
+        self.distance_limit_input.setDecimals(2)
+        self.distance_limit_input.setSingleStep(0.10)
+        self.distance_limit_input.setValue(1.0)
+        self.distance_limit_input.setSuffix(" m")
+        self.distance_reset_button = QPushButton("Zerar distancia acumulada")
+        distance_layout.addRow(self.distance_limit_enabled_check)
+        distance_layout.addRow("Parar apos", self.distance_limit_input)
+        distance_layout.addRow(self.distance_reset_button)
+        root.addWidget(distance_group)
+
         status_group = QGroupBox("Estado")
         status_layout = QFormLayout(status_group)
         status_layout.setContentsMargins(16, 20, 16, 14)
@@ -93,6 +124,8 @@ class SafetyPanel(QWidget):
         self.line_loss_elapsed_label = QLabel("-")
         self.roll_label = QLabel("-")
         self.battery_percent_label = QLabel("-")
+        self.distance_active_label = QLabel("-")
+        self.distance_traveled_label = QLabel("-")
         status_layout.addRow("motores bloqueados", self.blocked_label)
         status_layout.addRow("colisao ativa", self.collision_label)
         status_layout.addRow("bateria ativa", self.battery_label)
@@ -103,6 +136,8 @@ class SafetyPanel(QWidget):
         status_layout.addRow("tempo sem linha", self.line_loss_elapsed_label)
         status_layout.addRow("roll atual", self.roll_label)
         status_layout.addRow("bateria atual", self.battery_percent_label)
+        status_layout.addRow("limite distancia ativo", self.distance_active_label)
+        status_layout.addRow("distancia pelos encoders", self.distance_traveled_label)
         root.addWidget(status_group)
         root.addStretch(1)
 
@@ -113,6 +148,9 @@ class SafetyPanel(QWidget):
         self.roll_limit_input.editingFinished.connect(self._emit_roll_limit)
         self.battery_block_input.editingFinished.connect(self._emit_battery_block_percent)
         self.line_loss_timeout_input.editingFinished.connect(self._emit_line_loss_timeout)
+        self.distance_limit_enabled_check.toggled.connect(self._emit_distance_limit_enabled)
+        self.distance_limit_input.editingFinished.connect(self._emit_distance_limit)
+        self.distance_reset_button.clicked.connect(self.distance_reset_requested)
 
     def refresh(self, state: RobotState) -> None:
         self._updating = True
@@ -120,12 +158,15 @@ class SafetyPanel(QWidget):
         self.battery_block_enabled_check.setChecked(state.safety_battery_block_enabled)
         self.line_loss_enabled_check.setChecked(state.safety_line_loss_enabled)
         self.ble_loss_enabled_check.setChecked(state.safety_ble_loss_enabled)
+        self.distance_limit_enabled_check.setChecked(state.safety_distance_limit_enabled)
         if not self.roll_limit_input.hasFocus():
             self.roll_limit_input.setValue(state.safety_roll_limit_deg)
         if not self.battery_block_input.hasFocus():
             self.battery_block_input.setValue(state.safety_battery_block_percent)
         if not self.line_loss_timeout_input.hasFocus():
             self.line_loss_timeout_input.setValue(state.safety_line_loss_timeout_s)
+        if not self.distance_limit_input.hasFocus():
+            self.distance_limit_input.setValue(state.safety_distance_limit_m)
         self._updating = False
 
         self.blocked_label.setText("sim" if state.safety_motors_blocked else "nao")
@@ -138,6 +179,10 @@ class SafetyPanel(QWidget):
         self.line_loss_elapsed_label.setText(f"{state.safety_line_loss_elapsed_s:.2f} s")
         self.roll_label.setText(f"{state.safety_current_roll_deg:.1f} deg")
         self.battery_percent_label.setText(f"{state.safety_current_battery_percent:.1f} %")
+        self.distance_active_label.setText("sim" if state.safety_distance_limit_active else "nao")
+        self.distance_traveled_label.setText(
+            f"{state.safety_distance_traveled_m:.3f} m / {state.safety_distance_limit_m:.2f} m"
+        )
 
     def _emit_collision_enabled(self, enabled: bool) -> None:
         if not self._updating:
@@ -166,3 +211,11 @@ class SafetyPanel(QWidget):
     def _emit_line_loss_timeout(self) -> None:
         if not self._updating:
             self.line_loss_timeout_requested.emit(float(self.line_loss_timeout_input.value()))
+
+    def _emit_distance_limit_enabled(self, enabled: bool) -> None:
+        if not self._updating:
+            self.distance_limit_enabled_requested.emit(enabled)
+
+    def _emit_distance_limit(self) -> None:
+        if not self._updating:
+            self.distance_limit_requested.emit(float(self.distance_limit_input.value()))

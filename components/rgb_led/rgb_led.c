@@ -42,7 +42,23 @@ static rgb_led_state_t state = {
 };
 static portMUX_TYPE state_mux = portMUX_INITIALIZER_UNLOCKED;
 static TaskHandle_t rgb_led_task_handle;
+static uint32_t race_plan_blink_period_ms;
+static int64_t race_plan_blink_started_us;
+static uint8_t intensity_before_race_plan = RGB_LED_DEFAULT_INTENSITY;
+static bool race_plan_intensity_saved;
 static bool initialized;
+
+static void notify_rgb_led_task(void)
+{
+    TaskHandle_t task = NULL;
+    portENTER_CRITICAL(&state_mux);
+    task = rgb_led_task_handle;
+    portEXIT_CRITICAL(&state_mux);
+
+    if (task != NULL) {
+        xTaskNotifyGive(task);
+    }
+}
 
 static uint8_t scale_channel(uint8_t value, uint8_t intensity)
 {
@@ -164,8 +180,12 @@ static void rgb_led_task(void *arg)
 
     while (true) {
         rgb_led_state_t local;
+        uint32_t local_blink_period_ms = 0;
+        int64_t local_blink_started_us = 0;
         portENTER_CRITICAL(&state_mux);
         local = state;
+        local_blink_period_ms = race_plan_blink_period_ms;
+        local_blink_started_us = race_plan_blink_started_us;
         portEXIT_CRITICAL(&state_mux);
 
         if (!local.enabled || local.mode == RGB_LED_MODE_DISABLED) {
@@ -185,11 +205,31 @@ static void rgb_led_task(void *arg)
                 }
                 transmit_color(red, green, blue, local.intensity);
             } else {
-                transmit_color(local.red, local.green, local.blue, local.intensity);
+                bool blink_on = true;
+                if (local.mode == RGB_LED_MODE_RACE_PLAN && local_blink_period_ms > 0) {
+                    const int64_t half_period_us = ((int64_t)local_blink_period_ms * 1000LL) / 2LL;
+                    const int64_t elapsed_us = esp_timer_get_time() - local_blink_started_us;
+                    blink_on = half_period_us <= 0 || ((elapsed_us / half_period_us) % 2LL) == 0;
+                }
+                transmit_color(blink_on ? local.red : 0,
+                               blink_on ? local.green : 0,
+                               blink_on ? local.blue : 0,
+                               local.intensity);
             }
         }
 
-        vTaskDelay(pdMS_TO_TICKS(RGB_LED_UPDATE_PERIOD_MS));
+        uint32_t wait_ms = RGB_LED_UPDATE_PERIOD_MS;
+        if (local.mode == RGB_LED_MODE_RACE_PLAN && local_blink_period_ms > 0) {
+            const uint32_t half_period_ms = local_blink_period_ms > 1 ? local_blink_period_ms / 2U : 1U;
+            if (half_period_ms < wait_ms) {
+                wait_ms = half_period_ms;
+            }
+        }
+        TickType_t wait_ticks = pdMS_TO_TICKS(wait_ms);
+        if (wait_ticks == 0) {
+            wait_ticks = 1;
+        }
+        ulTaskNotifyTake(pdTRUE, wait_ticks);
     }
 }
 
@@ -248,9 +288,14 @@ esp_err_t rgb_led_init(void)
 
 esp_err_t rgb_led_set_enabled(bool enabled)
 {
+    bool changed = false;
     portENTER_CRITICAL(&state_mux);
+    changed = state.enabled != enabled;
     state.enabled = enabled;
     portEXIT_CRITICAL(&state_mux);
+    if (changed) {
+        notify_rgb_led_task();
+    }
     return save_settings_to_nvs();
 }
 
@@ -262,35 +307,137 @@ esp_err_t rgb_led_set_mode(rgb_led_mode_t mode)
         mode != RGB_LED_MODE_RACE_PLAN) {
         return ESP_ERR_INVALID_ARG;
     }
+    bool changed = false;
     portENTER_CRITICAL(&state_mux);
+    if (mode != RGB_LED_MODE_RACE_PLAN && race_plan_intensity_saved) {
+        state.intensity = intensity_before_race_plan;
+        race_plan_intensity_saved = false;
+    } else if (mode == RGB_LED_MODE_RACE_PLAN && !race_plan_intensity_saved) {
+        intensity_before_race_plan = state.mode == RGB_LED_MODE_RACE_PLAN ?
+                                         RGB_LED_DEFAULT_INTENSITY :
+                                         state.intensity;
+        race_plan_intensity_saved = true;
+        state.intensity = RGB_LED_RACE_PLAN_INTENSITY;
+    }
+    changed = state.mode != mode || state.enabled != (mode != RGB_LED_MODE_DISABLED) ||
+              race_plan_blink_period_ms != 0;
     state.mode = mode;
     state.enabled = mode != RGB_LED_MODE_DISABLED;
+    race_plan_blink_period_ms = 0;
     portEXIT_CRITICAL(&state_mux);
+    if (changed) {
+        notify_rgb_led_task();
+    }
     return save_settings_to_nvs();
 }
 
 esp_err_t rgb_led_set_manual_color(uint8_t red, uint8_t green, uint8_t blue, uint8_t intensity)
 {
+    bool changed = false;
     portENTER_CRITICAL(&state_mux);
+    race_plan_intensity_saved = false;
+    changed = state.red != red || state.green != green || state.blue != blue ||
+              state.intensity != intensity || state.mode != RGB_LED_MODE_MANUAL ||
+              !state.enabled || race_plan_blink_period_ms != 0;
     state.red = red;
     state.green = green;
     state.blue = blue;
     state.intensity = intensity;
     state.mode = RGB_LED_MODE_MANUAL;
     state.enabled = true;
+    race_plan_blink_period_ms = 0;
     portEXIT_CRITICAL(&state_mux);
+    if (changed) {
+        notify_rgb_led_task();
+    }
     return save_settings_to_nvs();
 }
 
 esp_err_t rgb_led_set_race_plan_color(uint8_t red, uint8_t green, uint8_t blue)
 {
+    bool changed = false;
     portENTER_CRITICAL(&state_mux);
+    if (!race_plan_intensity_saved) {
+        intensity_before_race_plan = state.mode == RGB_LED_MODE_RACE_PLAN ?
+                                         RGB_LED_DEFAULT_INTENSITY :
+                                         state.intensity;
+        race_plan_intensity_saved = true;
+    }
+    changed = state.red != red || state.green != green || state.blue != blue ||
+              state.mode != RGB_LED_MODE_RACE_PLAN || !state.enabled ||
+              state.intensity != RGB_LED_RACE_PLAN_INTENSITY || race_plan_blink_period_ms != 0;
     state.red = red;
     state.green = green;
     state.blue = blue;
+    state.intensity = RGB_LED_RACE_PLAN_INTENSITY;
     state.mode = RGB_LED_MODE_RACE_PLAN;
     state.enabled = true;
+    race_plan_blink_period_ms = 0;
     portEXIT_CRITICAL(&state_mux);
+
+    if (changed) {
+        notify_rgb_led_task();
+    }
+    return ESP_OK;
+}
+
+esp_err_t rgb_led_set_battery_mode_runtime(void)
+{
+    bool changed = false;
+    portENTER_CRITICAL(&state_mux);
+    changed = state.mode != RGB_LED_MODE_BATTERY || !state.enabled ||
+              race_plan_blink_period_ms != 0;
+    if (race_plan_intensity_saved) {
+        state.intensity = intensity_before_race_plan;
+        race_plan_intensity_saved = false;
+    }
+    state.mode = RGB_LED_MODE_BATTERY;
+    state.enabled = true;
+    race_plan_blink_period_ms = 0;
+    portEXIT_CRITICAL(&state_mux);
+
+    if (changed) {
+        notify_rgb_led_task();
+    }
+    return ESP_OK;
+}
+
+esp_err_t rgb_led_set_race_plan_blink(uint8_t red,
+                                      uint8_t green,
+                                      uint8_t blue,
+                                      uint32_t period_ms)
+{
+    if (period_ms == 0) {
+        return rgb_led_set_race_plan_color(red, green, blue);
+    }
+
+    const int64_t now_us = esp_timer_get_time();
+    bool changed = false;
+    portENTER_CRITICAL(&state_mux);
+    if (!race_plan_intensity_saved) {
+        intensity_before_race_plan = state.mode == RGB_LED_MODE_RACE_PLAN ?
+                                         RGB_LED_DEFAULT_INTENSITY :
+                                         state.intensity;
+        race_plan_intensity_saved = true;
+    }
+    changed = state.red != red || state.green != green || state.blue != blue ||
+              state.mode != RGB_LED_MODE_RACE_PLAN || !state.enabled ||
+              state.intensity != RGB_LED_RACE_PLAN_INTENSITY || race_plan_blink_period_ms != period_ms;
+    state.red = red;
+    state.green = green;
+    state.blue = blue;
+    state.intensity = RGB_LED_RACE_PLAN_INTENSITY;
+    state.mode = RGB_LED_MODE_RACE_PLAN;
+    state.enabled = true;
+    race_plan_blink_period_ms = period_ms;
+    if (changed) {
+        race_plan_blink_started_us = now_us;
+    }
+    portEXIT_CRITICAL(&state_mux);
+
+    if (changed) {
+        notify_rgb_led_task();
+    }
     return ESP_OK;
 }
 

@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from ble.map_download import MapDownload
 from ble.client import BleRobotClient
 from ble.protocol import (
     AUTH_TOKEN,
@@ -41,6 +42,7 @@ from ble.protocol import (
     pack_control_stop,
     pack_map_delete,
     pack_line_calibrate,
+    pack_line_filter,
     pack_line_threshold,
     pack_line_track_type,
     pack_odometry_position,
@@ -58,10 +60,16 @@ from ble.protocol import (
     pack_safety_battery_block_percent,
     pack_safety_ble_loss_enabled,
     pack_safety_collision_enabled,
+    pack_safety_distance_limit,
+    pack_safety_distance_limit_enabled,
+    pack_safety_reset_distance,
     pack_safety_line_loss_enabled,
     pack_safety_line_loss_timeout,
     pack_safety_roll_limit,
     pack_save_map_chunk,
+    pack_zero_brake_enabled,
+    pack_portal_config,
+    pack_telemetry_enabled,
     unpack_battery_telemetry,
     unpack_control_telemetry,
     unpack_encoder_telemetry,
@@ -78,6 +86,7 @@ from ble.protocol import (
     unpack_rgb_led_telemetry,
     unpack_safety_telemetry,
     unpack_system_telemetry,
+    unpack_portal_telemetry,
     unpack_telemetry_bundle,
 )
 from commands import robot_commands
@@ -92,9 +101,11 @@ from ui.race_plan_panel import RacePlanPanel
 from ui.rgb_led_panel import RgbLedPanel
 from ui.robot_3d_view import Robot3DView
 from ui.safety_panel import SafetyPanel
+from ui.portal_sensor_panel import PortalSensorPanel
 from ui.telemetry_panel import TelemetryPanel
+from ui.telemetry_config_panel import TelemetryConfigPanel
 
-UI_REFRESH_TARGET_HZ = 120
+UI_REFRESH_TARGET_HZ = 60
 UI_REFRESH_PERIOD_MS = round(1000 / UI_REFRESH_TARGET_HZ)
 MOTOR_COMMAND_PERIOD_MS = 40
 MAP_MAX_SEGMENT_M = 0.30
@@ -109,11 +120,19 @@ class MainWindow(QMainWindow):
         self.state.mag_ignored = self.settings.value("imu/mag_ignored", self.state.mag_ignored, type=bool)
         self.ble = BleRobotClient(self)
         self._loading_maps: dict[int, dict] = {}
+        self._map_download = MapDownload()
+        self._map_download_timer = QTimer(self)
+        self._map_download_timer.setSingleShot(True)
+        self._map_download_timer.timeout.connect(self._request_next_map_chunk)
         self._available_maps: list[dict] = []
         self._map_list_request_pending = False
         self._map_record_next_offset = 0
         self._map_record_poll_enabled = False
+        self._map_record_timer = QTimer(self)
+        self._map_record_timer.setSingleShot(True)
+        self._map_record_timer.timeout.connect(self._poll_map_record)
         self._pending_motor_pwm: dict[str, int] = {}
+        self._command_epoch = 0
         self._pending_status_action: str | None = None
 
         self._build_ui()
@@ -205,6 +224,8 @@ class MainWindow(QMainWindow):
         self.line_sensor_panel = LineSensorPanel()
         self.rgb_led_panel = RgbLedPanel()
         self.safety_panel = SafetyPanel()
+        self.portal_sensor_panel = PortalSensorPanel()
+        self.telemetry_config_panel = TelemetryConfigPanel(self.settings)
         tabs.addTab(self.plots_panel, "Graficos")
         tabs.addTab(self.map_view, "Odometria")
         tabs.addTab(self.navigation_control, "Controle")
@@ -213,6 +234,8 @@ class MainWindow(QMainWindow):
         tabs.addTab(self.line_sensor_panel, "Linha")
         tabs.addTab(self.rgb_led_panel, "LED")
         tabs.addTab(self.safety_panel, "Seguranca")
+        tabs.addTab(self.portal_sensor_panel, "Portal")
+        tabs.addTab(self.telemetry_config_panel, "Telemetria BLE")
 
         splitter.addWidget(self.left_panel)
         splitter.addWidget(tabs)
@@ -254,6 +277,9 @@ class MainWindow(QMainWindow):
         self.line_sensor_panel.threshold_requested.connect(
             lambda threshold_percent: self._send(pack_line_threshold(threshold_percent))
         )
+        self.line_sensor_panel.filter_requested.connect(
+            lambda filter_percent: self._send(pack_line_filter(filter_percent))
+        )
         self.rgb_led_panel.enabled_requested.connect(lambda enabled: self._send(pack_rgb_led_enabled(enabled)))
         self.rgb_led_panel.mode_requested.connect(lambda mode: self._send(pack_rgb_led_mode(mode)))
         self.rgb_led_panel.manual_requested.connect(
@@ -278,6 +304,15 @@ class MainWindow(QMainWindow):
         self.safety_panel.line_loss_timeout_requested.connect(
             lambda timeout_s: self._send(pack_safety_line_loss_timeout(timeout_s))
         )
+        self.safety_panel.distance_limit_enabled_requested.connect(
+            lambda enabled: self._send(pack_safety_distance_limit_enabled(enabled))
+        )
+        self.safety_panel.distance_limit_requested.connect(
+            lambda distance_m: self._send(pack_safety_distance_limit(distance_m))
+        )
+        self.safety_panel.distance_reset_requested.connect(
+            lambda: self._send(pack_safety_reset_distance())
+        )
         self.map_view.save_map_requested.connect(self._save_map)
         self.map_view.record_start_requested.connect(self._start_map_record)
         self.map_view.record_stop_requested.connect(self._stop_map_record)
@@ -294,13 +329,21 @@ class MainWindow(QMainWindow):
         self.navigation_control.auto_track_start_requested.connect(self._start_control_auto_track)
         self.navigation_control.stop_requested.connect(lambda: self._send(pack_control_stop()))
         self.navigation_control.pid_requested.connect(
-            lambda kp, ki, kd, limit: self._send(pack_control_pid(kp, ki, kd, limit))
+            lambda kp, ki, kd, limit, alpha: self._send(pack_control_pid(kp, ki, kd, limit, alpha))
+        )
+        self.portal_sensor_panel.config_requested.connect(
+            lambda enabled, threshold, speed, delay: self._send(pack_portal_config(enabled, threshold, speed, delay))
+        )
+        self.telemetry_config_panel.changed.connect(
+            lambda message_id, enabled: self._send(pack_telemetry_enabled(message_id, enabled))
+            if self.state.authenticated else None
         )
         self.navigation_control.pid_save_requested.connect(self._save_control_pid)
         self.navigation_control.aux_requested.connect(lambda aux: self._send(pack_control_aux_percent(aux)))
         self.navigation_control.battery_compensation_requested.connect(
             lambda enabled: self._send(pack_control_battery_compensation_enabled(enabled))
         )
+        self.navigation_control.zero_brake_requested.connect(lambda enabled: self._send(pack_zero_brake_enabled(enabled)))
         self.race_plan_panel.refresh_maps_requested.connect(self._request_map_list)
         self.race_plan_panel.map_load_requested.connect(self._load_map)
         self.race_plan_panel.apply_requested.connect(self._apply_race_plan)
@@ -347,6 +390,13 @@ class MainWindow(QMainWindow):
         self.state.connected = connected
         self.state.mode = "ble"
         if not connected:
+            self._map_download.cancel()
+            self._map_download_timer.stop()
+            self._map_record_poll_enabled = False
+            self._map_record_timer.stop()
+            self._command_epoch += 1
+            self._pending_motor_pwm.clear()
+            self.navigation_control.cancel_pending_commands()
             self.state.authenticated = False
         self._refresh_status()
         if connected:
@@ -356,10 +406,22 @@ class MainWindow(QMainWindow):
         self.state.authenticated = authenticated
         self._refresh_status()
         if authenticated:
+            for message_id, enabled in self.telemetry_config_panel.selections():
+                self._send(pack_telemetry_enabled(message_id, enabled))
             self._request_map_list(700)
 
     def _send(self, packet: bytes) -> None:
+        if self.ble._is_stop_command(packet):
+            self._map_download.cancel()
+            self._map_download_timer.stop()
+            self._command_epoch += 1
+            self._pending_motor_pwm.clear()
+            self.navigation_control.cancel_pending_commands()
         self.ble.write_command(packet)
+
+    def _send_later(self, delay_ms: int, packet: bytes) -> None:
+        epoch = self._command_epoch
+        QTimer.singleShot(delay_ms, lambda: self._send(packet) if epoch == self._command_epoch else None)
 
     def _queue_motor_pwm(self, motor: str, value: int) -> None:
         self._pending_motor_pwm[motor] = int(value)
@@ -432,6 +494,8 @@ class MainWindow(QMainWindow):
             self.rgb_led_panel.refresh(self.state)
         elif current_tab is self.safety_panel:
             self.safety_panel.refresh(self.state)
+        elif current_tab is self.portal_sensor_panel:
+            self.portal_sensor_panel.refresh(self.state)
         self._refresh_status()
 
     def _show_error(self, message: str) -> None:
@@ -486,7 +550,7 @@ class MainWindow(QMainWindow):
         for offset in range(0, len(points), MAP_CHUNK_MAX_POINTS):
             chunk = points[offset:offset + MAP_CHUNK_MAX_POINTS]
             packet = pack_save_map_chunk(clean_name, len(points), offset, chunk)
-            QTimer.singleShot(delay_ms, lambda packet=packet: self._send(packet))
+            self._send_later(delay_ms, packet)
             delay_ms += 140
         suffix = f", {removed_count} salto(s) removido(s)" if removed_count else ""
         self.statusBar().showMessage(f"Salvando mapa {clean_name} ({len(points)} pontos{suffix})", 5000)
@@ -501,10 +565,10 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"Gravacao no ESP iniciada: {clean_name}", 2500)
 
     def _stop_map_record(self) -> None:
-        self._map_record_poll_enabled = False
+        self._map_record_poll_enabled = True
         self._send(pack_map_record_stop())
-        QTimer.singleShot(250, lambda: self._request_map_record_chunk(self._map_record_next_offset))
-        self.statusBar().showMessage("Gravacao no ESP parada", 2500)
+        self._schedule_map_record_poll(100)
+        self.statusBar().showMessage("Aguardando confirmacao de parada da gravacao", 2500)
 
     def _save_map_record(self, name: str) -> None:
         clean_name = name.strip() or "mapa"
@@ -518,7 +582,7 @@ class MainWindow(QMainWindow):
         self._send(pack_read_map_record_chunk(offset))
 
     def _schedule_map_record_poll(self, delay_ms: int = 500) -> None:
-        QTimer.singleShot(delay_ms, self._poll_map_record)
+        self._map_record_timer.start(delay_ms)
 
     def _poll_map_record(self) -> None:
         if not self._map_record_poll_enabled:
@@ -546,8 +610,22 @@ class MainWindow(QMainWindow):
         return cleaned
 
     def _load_map(self, slot: int) -> None:
-        self._loading_maps[slot] = {"total": 0, "received": 0}
-        QTimer.singleShot(120, lambda slot=slot: self._send(pack_read_map_chunk(slot, 0)))
+        if not self._map_download.start(slot):
+            return  # Navigation and race-plan panels share this same download.
+        self._map_download_timer.stop()
+        self._request_next_map_chunk()
+
+    def _request_next_map_chunk(self) -> None:
+        transfer = self._map_download
+        if transfer.slot is None:
+            return
+        if transfer.attempts >= 3:
+            self._show_error("Leitura de mapa sem resposta; use Atualizar para tentar novamente")
+            transfer.cancel()
+            return
+        transfer.attempts += 1
+        self._send(pack_read_map_chunk(transfer.slot, transfer.offset))
+        self._map_download_timer.start(1000)
 
     def _delete_map(self, slot: int, name: str) -> None:
         label = name or f"slot {slot}"
@@ -567,14 +645,14 @@ class MainWindow(QMainWindow):
 
     def _start_control_map(self, slot: int, speed: int, source: int) -> None:
         self._send(pack_odometry_source(source))
-        QTimer.singleShot(220, lambda slot=slot, speed=speed: self._send(pack_control_start_map(slot, speed)))
+        self._send(pack_control_start_map(slot, speed))
 
     def _start_control_line(self, speed: int) -> None:
         self._send(pack_control_start_line(speed))
 
     def _start_control_auto_track(self, slot: int, speed: int, source: int) -> None:
         self._send(pack_odometry_source(source))
-        QTimer.singleShot(220, lambda slot=slot, speed=speed: self._send(pack_control_start_auto_track(slot, speed)))
+        self._send(pack_control_start_auto_track(slot, speed))
 
     def _race_plan_packets(
         self,
@@ -589,12 +667,11 @@ class MainWindow(QMainWindow):
         packets.extend(pack_control_race_plan(segments, True))
         return packets
 
-    def _send_spaced(self, packets: list[bytes], interval_ms: int = 180) -> int:
-        delay_ms = 0
+    def _send_spaced(self, packets: list[bytes], interval_ms: int = 0) -> int:
+        # The BLE worker serializes ATT writes; no UI timers are needed.
         for packet in packets:
-            QTimer.singleShot(delay_ms, lambda packet=packet: self._send(packet))
-            delay_ms += interval_ms
-        return delay_ms
+            self._send(packet)
+        return 0
 
     def _apply_race_plan(
         self,
@@ -628,8 +705,8 @@ class MainWindow(QMainWindow):
         if first_pose is not None:
             x_m, y_m, _heading_rad = first_pose
             packets.append(pack_odometry_position(x_m, y_m))
-        delay_ms = self._send_spaced(packets)
-        QTimer.singleShot(delay_ms + 260, lambda slot=slot, speed=speed: self._send(pack_control_start_auto_track(slot, speed)))
+        self._send_spaced(packets)
+        self._send(pack_control_start_auto_track(slot, speed, True))
         if first_pose is not None:
             self.statusBar().showMessage("Iniciando plano de corrida: posicao e angulo resetados no ponto 0", 2500)
         else:
@@ -639,9 +716,9 @@ class MainWindow(QMainWindow):
         self._send(pack_odometry_position(x_m, y_m))
         self.statusBar().showMessage(f"Posicao e angulo resetados: {x_m:.3f}, {y_m:.3f}", 2500)
 
-    def _save_control_pid(self, kp: float, ki: float, kd: float, limit: int, aux: int) -> None:
+    def _save_control_pid(self, kp: float, ki: float, kd: float, limit: int, aux: int, alpha: float) -> None:
         self._pending_status_action = "pid_save"
-        self._send(pack_control_save_pid(kp, ki, kd, limit, aux))
+        self._send(pack_control_save_pid(kp, ki, kd, limit, aux, alpha))
 
     def _on_telemetry_packet(self, data: bytes) -> None:
         try:
@@ -726,41 +803,24 @@ class MainWindow(QMainWindow):
             offset = int(chunk["offset"])
             point_count = int(chunk["point_count"])
             points = list(chunk["points"])
+            transfer = self._map_download
+            if not transfer.accept(slot, offset, point_count, total):
+                return  # Old/duplicate notifications do not schedule any extra requests.
+            self._map_download_timer.stop()
             if offset == 0:
-                self._loading_maps[slot] = {"total": total, "received": 0}
                 self.map_view.start_loaded_map(slot, total)
                 self.navigation_control.start_loaded_map(slot, total)
                 self.race_plan_panel.start_loaded_map(slot, total)
-            else:
-                loading = self._loading_maps.get(slot)
-                expected_offset = int(loading.get("received", 0)) if loading else 0
-                expected_total = int(loading.get("total", total)) if loading else total
-                if loading is None or total != expected_total or offset != expected_offset:
-                    self.statusBar().showMessage(
-                        f"Chunk mapa fora de ordem: offset {offset}, esperado {expected_offset}",
-                        2500,
-                    )
-                    QTimer.singleShot(
-                        200,
-                        lambda slot=slot, expected_offset=expected_offset: self._send(
-                            pack_read_map_chunk(slot, expected_offset)
-                        ),
-                    )
-                    return
             self.map_view.set_loaded_chunk(offset, points)
             self.navigation_control.set_loaded_chunk(offset, points)
             self.race_plan_panel.set_loaded_chunk(offset, points)
-            next_offset = offset + point_count
-            loading = self._loading_maps.setdefault(slot, {"total": total, "received": 0})
-            loading["total"] = total
-            loading["received"] = max(int(loading.get("received", 0)), next_offset)
-            if next_offset < total:
-                QTimer.singleShot(200, lambda slot=slot, next_offset=next_offset: self._send(pack_read_map_chunk(slot, next_offset)))
+            if not transfer.complete:
+                self._map_download_timer.start(0)
             else:
                 self.map_view.finish_loaded_map(slot)
                 self.navigation_control.finish_loaded_map(slot)
                 self.race_plan_panel.finish_loaded_map(slot)
-                self._loading_maps.pop(slot, None)
+                transfer.cancel()
         elif message_id == TelemetryId.MAP_RECORD_CHUNK:
             try:
                 chunk = unpack_map_record_chunk(payload)
@@ -787,17 +847,23 @@ class MainWindow(QMainWindow):
             if next_offset >= self._map_record_next_offset:
                 self._map_record_next_offset = next_offset
             if next_offset < total:
-                QTimer.singleShot(
-                    100,
-                    lambda next_offset=next_offset: self._request_map_record_chunk(next_offset),
-                )
-            elif not active:
+                self._map_record_poll_enabled = True
+                self._schedule_map_record_poll(100)
+            elif not active and not self.map_view.recording_request_pending:
                 self._map_record_poll_enabled = False
+                self._map_record_timer.stop()
+                self.statusBar().showMessage("Gravacao no ESP parada e sincronizada", 2500)
         elif message_id == TelemetryId.CONTROL:
             try:
                 self.state.update(unpack_control_telemetry(payload))
             except ValueError as exc:
                 self._show_error(f"Telemetria controle invalida: {exc}")
+        elif message_id == TelemetryId.PORTAL:
+            try:
+                self.state.update(unpack_portal_telemetry(payload))
+                self.portal_sensor_panel.record_sample(self.state)
+            except ValueError as exc:
+                self._show_error(f"Telemetria portal invalida: {exc}")
         elif message_id == TelemetryId.LINE:
             try:
                 self.state.update(unpack_line_telemetry(payload))
@@ -821,6 +887,7 @@ class MainWindow(QMainWindow):
         elif message_id == TelemetryId.SYSTEM:
             try:
                 self.state.update(unpack_system_telemetry(payload))
+                self.navigation_control.set_zero_brake_enabled(self.state.zero_brake_enabled)
             except ValueError as exc:
                 self._show_error(f"Telemetria sistema invalida: {exc}")
 

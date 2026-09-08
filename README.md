@@ -14,6 +14,10 @@ Firmware ESP-IDF para ESP32-S3 com arquitetura modular para controle e telemetri
 - `components/imu`: configuracao I2C do MPU-9250.
 - `components/memory`: configuracao base de NVS.
 
+## Documentação de hardware
+
+Materiais, esquemático funcional, pinagem, ligações do TB6612FNG e checklist de montagem: [docs/HARDWARE.md](docs/HARDWARE.md).
+
 ## Requisitos
 
 - ESP-IDF 5.3 instalado.

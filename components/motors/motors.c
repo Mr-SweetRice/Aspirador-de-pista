@@ -10,11 +10,15 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "memory_config.h"
+#include "nvs.h"
 #include "safety.h"
 
 static const char *TAG = "motors";
+static const char *ZERO_BRAKE_NVS_KEY = "mot_zero_brk";
 
 static bool initialized;
+static bool zero_brake_enabled = true;
 static int motor_percent[MOTORS_MOTOR_COUNT];
 static TaskHandle_t safety_guard_task_handle;
 static esp_timer_handle_t brake_release_timer_handle;
@@ -99,6 +103,35 @@ static esp_err_t set_tb6612_coast(const motors_config_t *config)
     return ESP_OK;
 }
 
+static void load_zero_brake_from_nvs(void)
+{
+    nvs_handle_t handle;
+    uint8_t stored = zero_brake_enabled ? 1U : 0U;
+    esp_err_t ret = nvs_open(MEMORY_NVS_NAMESPACE, NVS_READONLY, &handle);
+    if (ret != ESP_OK) {
+        return;
+    }
+    if (nvs_get_u8(handle, ZERO_BRAKE_NVS_KEY, &stored) == ESP_OK) {
+        zero_brake_enabled = stored != 0;
+    }
+    nvs_close(handle);
+}
+
+static esp_err_t save_zero_brake_to_nvs(bool enabled)
+{
+    nvs_handle_t handle;
+    esp_err_t ret = nvs_open(MEMORY_NVS_NAMESPACE, NVS_READWRITE, &handle);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+    ret = nvs_set_u8(handle, ZERO_BRAKE_NVS_KEY, enabled ? 1U : 0U);
+    if (ret == ESP_OK) {
+        ret = nvs_commit(handle);
+    }
+    nvs_close(handle);
+    return ret;
+}
+
 static void brake_release_timer_cb(void *arg)
 {
     (void)arg;
@@ -142,7 +175,12 @@ static void safety_guard_task(void *arg)
         }
         if (any_running && !safety_motors_allowed()) {
             ESP_LOGW(TAG, "Parando motores: bloqueio de seguranca ativo");
-            motors_stop_all_immediate();
+            safety_state_t safety = {0};
+            if (safety_get_state(&safety) && safety.distance_limit_active) {
+                motors_brake_drive();
+            } else {
+                motors_stop_all_immediate();
+            }
         }
         vTaskDelay(pdMS_TO_TICKS(100));
     }
@@ -153,6 +191,8 @@ esp_err_t motors_init(void)
     if (initialized) {
         return ESP_OK;
     }
+
+    load_zero_brake_from_nvs();
 
     ledc_timer_config_t timer = {
         .speed_mode = MOTORS_PWM_MODE,
@@ -204,13 +244,14 @@ esp_err_t motors_init(void)
 
     initialized = true;
     ESP_LOGI(TAG,
-             "Motores iniciados PWM=%u Hz L=%d R=%d AUX=%d STBY=%d guard_core=%d",
+             "Motores iniciados PWM=%u Hz L=%d R=%d AUX=%d STBY=%d guard_core=%d zero=%s",
              MOTORS_PWM_FREQ_HZ,
              MOTORS_LEFT_PWMA_GPIO,
              MOTORS_RIGHT_PWMB_GPIO,
              MOTORS_AUX_PWM_GPIO,
              MOTORS_TB6612_STBY_GPIO,
-             MOTORS_BATTERY_GUARD_TASK_CORE_ID);
+             MOTORS_BATTERY_GUARD_TASK_CORE_ID,
+             zero_brake_enabled ? "brake" : "coast");
     return ESP_OK;
 }
 
@@ -244,9 +285,11 @@ esp_err_t motors_set_percent(motors_motor_id_t motor, int percent)
     }
 
     if (percent == 0 && config->driver == MOTORS_DRIVER_TB6612 && config->has_direction) {
-        ESP_RETURN_ON_ERROR(set_tb6612_short_brake(config), TAG, "brake");
+        ESP_RETURN_ON_ERROR(zero_brake_enabled ? set_tb6612_short_brake(config) : set_tb6612_coast(config),
+                            TAG,
+                            "zero output");
         motor_percent[motor] = 0;
-        ESP_LOGD(TAG, "Motor %d brake", (int)motor);
+        ESP_LOGD(TAG, "Motor %d zero=%s", (int)motor, zero_brake_enabled ? "brake" : "coast");
         return ESP_OK;
     }
 
@@ -321,4 +364,29 @@ esp_err_t motors_brake_drive_for_ms(uint32_t duration_ms)
         }
     }
     return ret;
+}
+
+esp_err_t motors_set_zero_brake_enabled(bool enabled)
+{
+    if (!initialized) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (zero_brake_enabled == enabled) {
+        return ESP_OK;
+    }
+
+    esp_err_t ret = save_zero_brake_to_nvs(enabled);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Falha ao salvar freio em comando 0%%: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    zero_brake_enabled = enabled;
+    ESP_LOGI(TAG, "Freio em comando 0%% %s", enabled ? "habilitado" : "desabilitado");
+    return ESP_OK;
+}
+
+bool motors_get_zero_brake_enabled(void)
+{
+    return zero_brake_enabled;
 }

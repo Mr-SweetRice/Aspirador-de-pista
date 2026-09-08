@@ -7,6 +7,7 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "imu_config.h"
 #include "memory_config.h"
@@ -39,6 +40,7 @@ static i2c_master_dev_handle_t mpu_dev;
 static i2c_master_dev_handle_t mag_dev;
 static TaskHandle_t imu_task_handle;
 static esp_timer_handle_t imu_timer_handle;
+static SemaphoreHandle_t i2c_access_mutex;
 static portMUX_TYPE state_mux = portMUX_INITIALIZER_UNLOCKED;
 
 static imu_state_t state;
@@ -681,7 +683,12 @@ static void imu_task(void *arg)
         const float dt_s = (float)(now_us - last_us) / 1000000.0f;
         last_us = now_us;
 
-        if (read_imu_raw(accel, gyro, mag, mag_uncalibrated, &mag_valid)) {
+        bool read_ok = false;
+        if (imu_i2c_lock(20)) {
+            read_ok = read_imu_raw(accel, gyro, mag, mag_uncalibrated, &mag_valid);
+            imu_i2c_unlock();
+        }
+        if (read_ok) {
             next.sample_hz = sample_hz;
             stationary_calibration_update(accel, gyro);
             stationary_calibration_finish_if_needed();
@@ -740,6 +747,10 @@ esp_err_t imu_init(void)
         return ESP_OK;
     }
 
+    i2c_access_mutex = xSemaphoreCreateMutex();
+    if (i2c_access_mutex == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
     ESP_RETURN_ON_ERROR(imu_bus_init(), TAG, "bus init");
     ESP_RETURN_ON_ERROR(mpu9250_init(), TAG, "mpu9250 init");
 
@@ -1008,4 +1019,24 @@ bool imu_get_state(imu_state_t *out_state)
     *out_state = state;
     portEXIT_CRITICAL(&state_mux);
     return true;
+}
+
+i2c_master_bus_handle_t imu_get_i2c_bus(void)
+{
+    /* O barramento e criado antes da sondagem do MPU-9250. Outros sensores
+       I2C ainda podem usa-lo quando a IMU estiver ausente ou falhar. */
+    return i2c_bus;
+}
+
+bool imu_i2c_lock(uint32_t timeout_ms)
+{
+    return i2c_access_mutex != NULL &&
+           xSemaphoreTake(i2c_access_mutex, pdMS_TO_TICKS(timeout_ms)) == pdTRUE;
+}
+
+void imu_i2c_unlock(void)
+{
+    if (i2c_access_mutex != NULL) {
+        xSemaphoreGive(i2c_access_mutex);
+    }
 }

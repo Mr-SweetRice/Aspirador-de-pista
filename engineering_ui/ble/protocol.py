@@ -7,7 +7,7 @@ from enum import IntEnum
 DEVICE_NAME = "AspiradorPista-S3"
 AUTH_TOKEN = "engineering-token"
 MAP_NAME_MAX_LEN = 15
-MAP_MAX_POINTS = 2048
+MAP_MAX_POINTS = 3072
 MAP_CHUNK_MAX_POINTS = 12
 CONTROL_MAX_PID_GAIN = 1000.0
 RACE_PLAN_MAX_SEGMENTS = 64
@@ -55,6 +55,7 @@ class SendId(IntEnum):
     SET_LEFT_PWM = 0x10
     SET_RIGHT_PWM = 0x11
     SET_AUX_PWM = 0x12
+    SET_ZERO_BRAKE_ENABLED = 0x13
     RESET_ENCODERS = 0x20
     RESET_YAW = 0x21
     MAP_RECORD_START = 0x22
@@ -86,6 +87,7 @@ class SendId(IntEnum):
     LINE_CALIBRATE = 0x50
     LINE_SET_TRACK_TYPE = 0x51
     LINE_SET_THRESHOLD = 0x52
+    LINE_SET_FILTER = 0x53
     RGB_LED_SET_ENABLED = 0x60
     RGB_LED_SET_MODE = 0x61
     RGB_LED_SET_MANUAL = 0x62
@@ -96,6 +98,11 @@ class SendId(IntEnum):
     SAFETY_SET_LINE_LOSS_ENABLED = 0x74
     SAFETY_SET_LINE_LOSS_TIMEOUT = 0x75
     SAFETY_SET_BLE_LOSS_ENABLED = 0x76
+    SAFETY_SET_DISTANCE_LIMIT_ENABLED = 0x77
+    SAFETY_SET_DISTANCE_LIMIT = 0x78
+    SAFETY_RESET_DISTANCE = 0x79
+    PORTAL_SET_CONFIG = 0x80
+    TELEMETRY_SET_ENABLED = 0x81
 
 
 class TelemetryId(IntEnum):
@@ -117,12 +124,24 @@ class TelemetryId(IntEnum):
     RGB_LED = 0x31
     SAFETY = 0x32
     SYSTEM = 0x33
+    PORTAL = 0x34
 
 
-IMU_TELEMETRY_FRAME = struct.Struct("<" + ("f" * 24) + "BB")
+TELEMETRY_CONFIGURABLE_IDS = frozenset({
+    int(TelemetryId.ENCODERS), int(TelemetryId.LINE), int(TelemetryId.ODOMETRY),
+    int(TelemetryId.BATTERY), int(TelemetryId.IMU), int(TelemetryId.POSE),
+    int(TelemetryId.LINE_FAST), int(TelemetryId.IMU_FAST), int(TelemetryId.CONTROL),
+    int(TelemetryId.RGB_LED), int(TelemetryId.SAFETY), int(TelemetryId.SYSTEM),
+    int(TelemetryId.PORTAL),
+})
+
+
+IMU_TELEMETRY_FRAME = struct.Struct("<fff")
+IMU_TELEMETRY_FULL_LEGACY_FRAME = struct.Struct("<" + ("f" * 24) + "BB")
 IMU_TELEMETRY_LEGACY_FRAME = struct.Struct("<" + ("f" * 23) + "BB")
 IMU_TELEMETRY_RAW_DIAGNOSTIC_FRAME = struct.Struct("<" + ("f" * 30) + "BB")
-IMU_FAST_TELEMETRY_FRAME = struct.Struct("<fffffBB")
+IMU_FAST_TELEMETRY_FRAME = struct.Struct("<fff")
+IMU_FAST_TELEMETRY_LEGACY_FRAME = struct.Struct("<fffffBB")
 ENCODER_TELEMETRY_FRAME = struct.Struct("<iifff")
 ENCODER_TELEMETRY_LEGACY_FRAME = struct.Struct("<iiff")
 BATTERY_TELEMETRY_FRAME = struct.Struct("<ffH")
@@ -141,10 +160,14 @@ MAP_RECORD_CHUNK_HEADER = struct.Struct("<HHBBHf")
 CONTROL_START_FRAME = struct.Struct("<Bb")
 CONTROL_PID_FRAME = struct.Struct("<fffB")
 CONTROL_SAVE_PID_FRAME = struct.Struct("<fffBB")
+CONTROL_PID_ALPHA_FRAME = struct.Struct("<fffBf")
+CONTROL_SAVE_PID_ALPHA_FRAME = struct.Struct("<fffBBf")
 CONTROL_SPEED_PROFILE_POINT_FRAME = struct.Struct("<BfffB")
 CONTROL_AUTO_TRACK_CONFIG_FRAME = struct.Struct("<BBfB")
 CONTROL_RACE_PLAN_CHUNK_HEADER = struct.Struct("<BBBB")
 CONTROL_RACE_PLAN_SEGMENT_FRAME = struct.Struct("<HHBBBBfff")
+CONTROL_TELEMETRY_LINE_CONTROLLER_FRAME = struct.Struct("<BBHHbffffffffBfffffBBBBffBfffBBHHBBBBf" + ("f" * 12))
+CONTROL_TELEMETRY_ALPHA_FRAME = struct.Struct("<BBHHbffffffffBfffffBBBBffBfffBBHHBBBBff")
 CONTROL_TELEMETRY_FRAME = struct.Struct("<BBHHbffffffffBfffffBBBBffBfffBBHHBBBBf")
 CONTROL_TELEMETRY_PRE_TASKS_FRAME = struct.Struct("<BBHHbffffffffBfBBBBffBfffBBHHBBBBf")
 CONTROL_TELEMETRY_PRE_RACE_AVERAGE_FRAME = struct.Struct("<BBHHbffffffffBfBBBBffBfffBBHHBBBB")
@@ -157,29 +180,23 @@ CONTROL_TELEMETRY_PRE_AUX_FRAME = struct.Struct("<BBHHbffffffffBfBB")
 CONTROL_TELEMETRY_PRE_PROFILE_FRAME = struct.Struct("<BBHHbffffffffBfB")
 CONTROL_TELEMETRY_PRE_MODE_FRAME = struct.Struct("<BBHHbffffffffBf")
 CONTROL_TELEMETRY_LEGACY_FRAME = struct.Struct("<BBHHbffffffffB")
+LINE_TELEMETRY_FILTER_FRAME = struct.Struct("<" + ("H" * 24) + "HBBBfB")
 LINE_TELEMETRY_FRAME = struct.Struct("<" + ("H" * 24) + "HBBBf")
+LINE_FAST_TELEMETRY_FILTER_FRAME = struct.Struct("<HBBBfB")
 LINE_FAST_TELEMETRY_FRAME = struct.Struct("<HBBBf")
 LINE_TELEMETRY_PRE_HZ_FRAME = struct.Struct("<" + ("H" * 24) + "HBBB")
 LINE_TELEMETRY_LEGACY_FRAME = struct.Struct("<" + ("H" * 24) + "HBB")
 RGB_LED_TELEMETRY_FRAME = struct.Struct("<BBBBBB")
+SAFETY_TELEMETRY_DISTANCE_FRAME = struct.Struct("<Hffffffff")
 SAFETY_TELEMETRY_FRAME = struct.Struct("<Hffffff")
 SAFETY_TELEMETRY_U8_FLAGS_FRAME = struct.Struct("<Bffffff")
 SAFETY_TELEMETRY_PRE_LINE_FRAME = struct.Struct("<Bffff")
-SYSTEM_TELEMETRY_FRAME = struct.Struct("<ff")
-IMU_FLAG_MAG_CALIBRATING = 1 << 0
-IMU_FLAG_MAG_CALIBRATED = 1 << 1
-IMU_FLAG_ACCEL_GYRO_CALIBRATING = 1 << 2
-IMU_FLAG_ACCEL_GYRO_CALIBRATED = 1 << 3
-IMU_FLAG_MAG_IGNORED = 1 << 4
-IMU_FLAG_YAW_DRIFT_CALIBRATING = 1 << 5
-IMU_FLAG_YAW_DRIFT_CALIBRATED = 1 << 6
-
-MAG_HEADING_MODE_LABELS = {
-    0: "XY",
-    1: "XZ",
-    2: "YZ",
-}
-
+SYSTEM_TELEMETRY_FRAME = struct.Struct("<ffB")
+SYSTEM_TELEMETRY_LEGACY_FRAME = struct.Struct("<ff")
+PORTAL_CONFIG_FRAME = struct.Struct("<BH BH".replace(" ", ""))
+PORTAL_TELEMETRY_FRAME_V1 = struct.Struct("<BBBBBHHBH")
+PORTAL_TELEMETRY_FRAME = struct.Struct("<BBBBBHHBHBI")
+SYSTEM_FLAG_ZERO_BRAKE_ENABLED = 1 << 0
 ODOMETRY_SOURCE_FUSED = 2
 
 ODOMETRY_SOURCE_LABELS = {
@@ -266,149 +283,32 @@ def unpack_telemetry_bundle(payload: bytes) -> list[tuple[int, bytes]]:
 
 
 def unpack_imu_telemetry(payload: bytes) -> dict:
-    if len(payload) == IMU_TELEMETRY_LEGACY_FRAME.size:
-        (
-            roll,
-            pitch,
-            yaw,
-            mag_yaw,
-            mag_yaw_xy,
-            mag_yaw_xz,
-            mag_yaw_yz,
-            mag_yaw_error,
-            mag_norm,
-            mag_filter_gain,
-            quat_w,
-            quat_x,
-            quat_y,
-            quat_z,
-            accel_x,
-            accel_y,
-            accel_z,
-            gyro_x,
-            gyro_y,
-            gyro_z,
-            mag_x,
-            mag_y,
-            mag_z,
-            mag_heading_mode,
-            flags,
-        ) = IMU_TELEMETRY_LEGACY_FRAME.unpack(payload)
-        yaw_drift_threshold = 0.05
-    elif len(payload) == IMU_TELEMETRY_FRAME.size:
-        (
-            roll,
-            pitch,
-            yaw,
-            mag_yaw,
-            mag_yaw_xy,
-            mag_yaw_xz,
-            mag_yaw_yz,
-            mag_yaw_error,
-            mag_norm,
-            mag_filter_gain,
-            yaw_drift_threshold,
-            quat_w,
-            quat_x,
-            quat_y,
-            quat_z,
-            accel_x,
-            accel_y,
-            accel_z,
-            gyro_x,
-            gyro_y,
-            gyro_z,
-            mag_x,
-            mag_y,
-            mag_z,
-            mag_heading_mode,
-            flags,
-        ) = IMU_TELEMETRY_FRAME.unpack(payload)
-    elif len(payload) == IMU_TELEMETRY_RAW_DIAGNOSTIC_FRAME.size:
-        (
-            roll,
-            pitch,
-            yaw,
-            mag_yaw,
-            mag_yaw_xy,
-            mag_yaw_xz,
-            mag_yaw_yz,
-            _mag_raw_yaw_xy,
-            _mag_raw_yaw_xz,
-            _mag_raw_yaw_yz,
-            mag_yaw_error,
-            mag_norm,
-            _mag_raw_norm,
-            mag_filter_gain,
-            quat_w,
-            quat_x,
-            quat_y,
-            quat_z,
-            accel_x,
-            accel_y,
-            accel_z,
-            gyro_x,
-            gyro_y,
-            gyro_z,
-            mag_x,
-            mag_y,
-            mag_z,
-            _mag_raw_x,
-            _mag_raw_y,
-            _mag_raw_z,
-            mag_heading_mode,
-            flags,
-        ) = IMU_TELEMETRY_RAW_DIAGNOSTIC_FRAME.unpack(payload)
-        yaw_drift_threshold = 0.05
-    else:
+    supported_sizes = {
+        IMU_TELEMETRY_FRAME.size,
+        IMU_TELEMETRY_FULL_LEGACY_FRAME.size,
+        IMU_TELEMETRY_LEGACY_FRAME.size,
+        IMU_TELEMETRY_RAW_DIAGNOSTIC_FRAME.size,
+    }
+    if len(payload) not in supported_sizes:
         raise ValueError("payload IMU com tamanho invalido")
 
+    roll, pitch, yaw = IMU_TELEMETRY_FRAME.unpack_from(payload)
     return {
         "roll": roll,
         "pitch": pitch,
         "yaw": yaw,
-        "mag_yaw": mag_yaw,
-        "mag_yaw_xy": mag_yaw_xy,
-        "mag_yaw_xz": mag_yaw_xz,
-        "mag_yaw_yz": mag_yaw_yz,
-        "mag_yaw_error": mag_yaw_error,
-        "mag_norm": mag_norm,
-        "mag_filter_gain": mag_filter_gain,
-        "yaw_drift_threshold": yaw_drift_threshold,
-        "mag_heading_mode": mag_heading_mode,
-        "quaternion": (quat_w, quat_x, quat_y, quat_z),
-        "accel": (accel_x, accel_y, accel_z),
-        "gyro": (gyro_x, gyro_y, gyro_z),
-        "mag": (mag_x, mag_y, mag_z),
-        "mag_ignored": bool(flags & IMU_FLAG_MAG_IGNORED),
-        "mag_calibrating": bool(flags & IMU_FLAG_MAG_CALIBRATING),
-        "mag_calibrated": bool(flags & IMU_FLAG_MAG_CALIBRATED),
-        "accel_gyro_calibrating": bool(flags & IMU_FLAG_ACCEL_GYRO_CALIBRATING),
-        "accel_gyro_calibrated": bool(flags & IMU_FLAG_ACCEL_GYRO_CALIBRATED),
-        "yaw_drift_calibrating": bool(flags & IMU_FLAG_YAW_DRIFT_CALIBRATING),
-        "yaw_drift_calibrated": bool(flags & IMU_FLAG_YAW_DRIFT_CALIBRATED),
     }
 
 
 def unpack_imu_fast_telemetry(payload: bytes) -> dict:
-    if len(payload) != IMU_FAST_TELEMETRY_FRAME.size:
+    if len(payload) not in {IMU_FAST_TELEMETRY_FRAME.size, IMU_FAST_TELEMETRY_LEGACY_FRAME.size}:
         raise ValueError("payload IMU rapida com tamanho invalido")
 
-    roll, pitch, yaw, gyro_z, sample_hz, mag_heading_mode, flags = IMU_FAST_TELEMETRY_FRAME.unpack(payload)
+    roll, pitch, yaw = IMU_FAST_TELEMETRY_FRAME.unpack_from(payload)
     return {
         "roll": roll,
         "pitch": pitch,
         "yaw": yaw,
-        "gyro_z_dps": gyro_z,
-        "imu_loop_hz": sample_hz,
-        "mag_heading_mode": mag_heading_mode,
-        "mag_ignored": bool(flags & IMU_FLAG_MAG_IGNORED),
-        "mag_calibrating": bool(flags & IMU_FLAG_MAG_CALIBRATING),
-        "mag_calibrated": bool(flags & IMU_FLAG_MAG_CALIBRATED),
-        "accel_gyro_calibrating": bool(flags & IMU_FLAG_ACCEL_GYRO_CALIBRATING),
-        "accel_gyro_calibrated": bool(flags & IMU_FLAG_ACCEL_GYRO_CALIBRATED),
-        "yaw_drift_calibrating": bool(flags & IMU_FLAG_YAW_DRIFT_CALIBRATING),
-        "yaw_drift_calibrated": bool(flags & IMU_FLAG_YAW_DRIFT_CALIBRATED),
     }
 
 
@@ -663,9 +563,10 @@ def pack_control_start_map(slot: int, speed_percent: int) -> bytes:
     return pack_packet(CommandClass.SEND, SendId.CONTROL_START_MAP, CONTROL_START_FRAME.pack(slot & 0xFF, speed))
 
 
-def pack_control_start_auto_track(slot: int, speed_percent: int) -> bytes:
+def pack_control_start_auto_track(slot: int, speed_percent: int, use_race_plan: bool = False) -> bytes:
     speed = max(-100, min(100, int(speed_percent)))
-    return pack_packet(CommandClass.SEND, SendId.CONTROL_START_AUTO_TRACK, CONTROL_START_FRAME.pack(slot & 0xFF, speed))
+    payload = CONTROL_START_FRAME.pack(slot & 0xFF, speed) + struct.pack("<B", 1 if use_race_plan else 0)
+    return pack_packet(CommandClass.SEND, SendId.CONTROL_START_AUTO_TRACK, payload)
 
 
 def pack_control_start_line(speed_percent: int) -> bytes:
@@ -677,17 +578,19 @@ def pack_control_stop() -> bytes:
     return pack_packet(CommandClass.SEND, SendId.CONTROL_STOP)
 
 
-def pack_control_pid(kp: float, ki: float, kd: float, motor_limit_percent: int) -> bytes:
+def pack_control_pid(kp: float, ki: float, kd: float, motor_limit_percent: int, alpha: float | None = None) -> bytes:
     limit = max(0, min(100, int(motor_limit_percent)))
+    safe_kp = max(0.0, min(CONTROL_MAX_PID_GAIN, float(kp)))
+    safe_ki = max(0.0, min(CONTROL_MAX_PID_GAIN, float(ki)))
+    safe_kd = max(0.0, min(CONTROL_MAX_PID_GAIN, float(kd)))
+    if alpha is None:
+        payload = CONTROL_PID_FRAME.pack(safe_kp, safe_ki, safe_kd, limit)
+    else:
+        payload = CONTROL_PID_ALPHA_FRAME.pack(safe_kp, safe_ki, safe_kd, limit, max(0.0, min(1.0, float(alpha))))
     return pack_packet(
         CommandClass.SEND,
         SendId.CONTROL_SET_PID,
-        CONTROL_PID_FRAME.pack(
-            max(0.0, min(CONTROL_MAX_PID_GAIN, float(kp))),
-            max(0.0, min(CONTROL_MAX_PID_GAIN, float(ki))),
-            max(0.0, min(CONTROL_MAX_PID_GAIN, float(kd))),
-            limit,
-        ),
+        payload,
     )
 
 
@@ -697,6 +600,7 @@ def pack_control_save_pid(
     kd: float,
     motor_limit_percent: int,
     aux_percent: int | None = None,
+    alpha: float | None = None,
 ) -> bytes:
     limit = max(0, min(100, int(motor_limit_percent)))
     safe_kp = max(0.0, min(CONTROL_MAX_PID_GAIN, float(kp)))
@@ -705,7 +609,17 @@ def pack_control_save_pid(
     payload = CONTROL_PID_FRAME.pack(safe_kp, safe_ki, safe_kd, limit)
     if aux_percent is not None:
         aux = max(0, min(100, int(aux_percent)))
-        payload = CONTROL_SAVE_PID_FRAME.pack(safe_kp, safe_ki, safe_kd, limit, aux)
+        if alpha is None:
+            payload = CONTROL_SAVE_PID_FRAME.pack(safe_kp, safe_ki, safe_kd, limit, aux)
+        else:
+            payload = CONTROL_SAVE_PID_ALPHA_FRAME.pack(
+                safe_kp,
+                safe_ki,
+                safe_kd,
+                limit,
+                aux,
+                max(0.0, min(1.0, float(alpha))),
+            )
     return pack_packet(
         CommandClass.SEND,
         SendId.CONTROL_SAVE_PID,
@@ -740,6 +654,41 @@ def pack_control_speed_profile_enabled(enabled: bool) -> bytes:
 def pack_control_aux_percent(aux_percent: int) -> bytes:
     aux = max(0, min(100, int(aux_percent)))
     return pack_packet(CommandClass.SEND, SendId.CONTROL_SET_AUX_PERCENT, struct.pack("<B", aux))
+
+
+def pack_zero_brake_enabled(enabled: bool) -> bytes:
+    return pack_packet(CommandClass.SEND, SendId.SET_ZERO_BRAKE_ENABLED, struct.pack("<B", 1 if enabled else 0))
+
+
+def pack_portal_config(enabled: bool, threshold_mm: int, stop_speed_percent: int, stop_delay_ms: int) -> bytes:
+    payload = PORTAL_CONFIG_FRAME.pack(1 if enabled else 0, max(30, min(2000, int(threshold_mm))), max(0, min(100, int(stop_speed_percent))), max(0, min(10000, int(stop_delay_ms))))
+    return pack_packet(CommandClass.SEND, SendId.PORTAL_SET_CONFIG, payload)
+
+
+def pack_telemetry_enabled(message_id: int, enabled: bool) -> bytes:
+    if message_id not in TELEMETRY_CONFIGURABLE_IDS:
+        raise ValueError(f"telemetria 0x{message_id:02x} nao pode ser configurada")
+    return pack_packet(
+        CommandClass.SEND,
+        SendId.TELEMETRY_SET_ENABLED,
+        struct.pack("<BB", int(message_id), 1 if enabled else 0),
+    )
+
+
+def unpack_portal_telemetry(payload: bytes) -> dict:
+    if len(payload) == PORTAL_TELEMETRY_FRAME.size:
+        enabled, sensor_ok, detected, count, stopping, distance_mm, threshold_mm, speed, delay_ms, gpio1_active, gpio1_events = PORTAL_TELEMETRY_FRAME.unpack(payload)
+    elif len(payload) == PORTAL_TELEMETRY_FRAME_V1.size:
+        enabled, sensor_ok, detected, count, stopping, distance_mm, threshold_mm, speed, delay_ms = PORTAL_TELEMETRY_FRAME_V1.unpack(payload)
+        gpio1_active = gpio1_events = None
+    else:
+        raise ValueError(
+            f"portal esperado {PORTAL_TELEMETRY_FRAME_V1.size} ou {PORTAL_TELEMETRY_FRAME.size} bytes, recebido {len(payload)}"
+        )
+    result = {"portal_enabled": bool(enabled), "portal_sensor_ok": bool(sensor_ok), "portal_detected": bool(detected), "portal_count": count, "portal_stopping": bool(stopping), "portal_distance_mm": distance_mm, "portal_threshold_mm": threshold_mm, "portal_stop_speed_percent": speed, "portal_stop_delay_ms": delay_ms}
+    if gpio1_active is not None:
+        result.update({"portal_gpio1_active": bool(gpio1_active), "portal_gpio1_events": gpio1_events})
+    return result
 
 
 def pack_control_battery_compensation_enabled(enabled: bool) -> bytes:
@@ -840,6 +789,11 @@ def pack_line_threshold(threshold_percent: int) -> bytes:
     return pack_packet(CommandClass.SEND, SendId.LINE_SET_THRESHOLD, struct.pack("<B", value))
 
 
+def pack_line_filter(filter_percent: int) -> bytes:
+    value = max(0, min(100, int(filter_percent)))
+    return pack_packet(CommandClass.SEND, SendId.LINE_SET_FILTER, struct.pack("<B", value))
+
+
 def pack_rgb_led_enabled(enabled: bool) -> bytes:
     return pack_packet(CommandClass.SEND, SendId.RGB_LED_SET_ENABLED, struct.pack("<B", 1 if enabled else 0))
 
@@ -893,6 +847,19 @@ def pack_safety_line_loss_timeout(timeout_s: float) -> bytes:
     return pack_packet(CommandClass.SEND, SendId.SAFETY_SET_LINE_LOSS_TIMEOUT, struct.pack("<f", value))
 
 
+def pack_safety_distance_limit_enabled(enabled: bool) -> bytes:
+    return pack_packet(CommandClass.SEND, SendId.SAFETY_SET_DISTANCE_LIMIT_ENABLED, struct.pack("<B", 1 if enabled else 0))
+
+
+def pack_safety_distance_limit(distance_m: float) -> bytes:
+    value = max(0.01, min(1000.0, float(distance_m)))
+    return pack_packet(CommandClass.SEND, SendId.SAFETY_SET_DISTANCE_LIMIT, struct.pack("<f", value))
+
+
+def pack_safety_reset_distance() -> bytes:
+    return pack_packet(CommandClass.SEND, SendId.SAFETY_RESET_DISTANCE)
+
+
 def unpack_control_telemetry(payload: bytes) -> dict:
     control_map_pose_valid = False
     control_map_x = 0.0
@@ -912,7 +879,96 @@ def unpack_control_telemetry(payload: bytes) -> dict:
     track_odometry_loop_hz = 0.0
     line_sensor_loop_hz = 0.0
     imu_loop_hz = 0.0
-    if len(payload) == CONTROL_TELEMETRY_FRAME.size:
+    line_alpha = 0.7
+    if len(payload) == CONTROL_TELEMETRY_LINE_CONTROLLER_FRAME.size:
+        (
+            running,
+            map_slot,
+            target_index,
+            point_count,
+            speed,
+            target_x,
+            target_y,
+            distance,
+            error,
+            steer,
+            kp,
+            ki,
+            kd,
+            motor_limit,
+            loop_hz,
+            race_plan_loop_hz,
+            track_odometry_loop_hz,
+            line_sensor_loop_hz,
+            imu_loop_hz,
+            mode,
+            speed_profile_enabled,
+            aux_percent,
+            active_aux_percent,
+            average_speed_mps,
+            max_speed_mps,
+            battery_compensation_enabled,
+            control_map_x,
+            control_map_y,
+            control_map_heading,
+            race_segment_active,
+            race_segment_type,
+            race_segment_start,
+            race_segment_end,
+            race_segment_speed,
+            race_segment_max_speed,
+            race_segment_aux,
+            active_speed_percent,
+            race_plan_average_speed_mps,
+            *_line_controller_fields,
+        ) = CONTROL_TELEMETRY_LINE_CONTROLLER_FRAME.unpack(payload)
+        control_map_pose_valid = True
+        active_speed_received = True
+    elif len(payload) == CONTROL_TELEMETRY_ALPHA_FRAME.size:
+        (
+            running,
+            map_slot,
+            target_index,
+            point_count,
+            speed,
+            target_x,
+            target_y,
+            distance,
+            error,
+            steer,
+            kp,
+            ki,
+            kd,
+            motor_limit,
+            loop_hz,
+            race_plan_loop_hz,
+            track_odometry_loop_hz,
+            line_sensor_loop_hz,
+            imu_loop_hz,
+            mode,
+            speed_profile_enabled,
+            aux_percent,
+            active_aux_percent,
+            average_speed_mps,
+            max_speed_mps,
+            battery_compensation_enabled,
+            control_map_x,
+            control_map_y,
+            control_map_heading,
+            race_segment_active,
+            race_segment_type,
+            race_segment_start,
+            race_segment_end,
+            race_segment_speed,
+            race_segment_max_speed,
+            race_segment_aux,
+            active_speed_percent,
+            race_plan_average_speed_mps,
+            line_alpha,
+        ) = CONTROL_TELEMETRY_ALPHA_FRAME.unpack(payload)
+        control_map_pose_valid = True
+        active_speed_received = True
+    elif len(payload) == CONTROL_TELEMETRY_FRAME.size:
         (
             running,
             map_slot,
@@ -1295,6 +1351,7 @@ def unpack_control_telemetry(payload: bytes) -> dict:
         "control_kp": kp,
         "control_ki": ki,
         "control_kd": kd,
+        "control_line_alpha": line_alpha,
         "control_motor_limit_percent": motor_limit,
         "control_loop_hz": loop_hz,
         "race_plan_loop_hz": race_plan_loop_hz,
@@ -1324,7 +1381,13 @@ def unpack_control_telemetry(payload: bytes) -> dict:
 
 
 def unpack_line_telemetry(payload: bytes) -> dict:
-    if len(payload) == LINE_TELEMETRY_FRAME.size:
+    filter_percent = 100
+    if len(payload) == LINE_TELEMETRY_FILTER_FRAME.size:
+        values = LINE_TELEMETRY_FILTER_FRAME.unpack(payload)
+        threshold_percent = values[27]
+        read_hz = values[28]
+        filter_percent = values[29]
+    elif len(payload) == LINE_TELEMETRY_FRAME.size:
         values = LINE_TELEMETRY_FRAME.unpack(payload)
         threshold_percent = values[27]
         read_hz = values[28]
@@ -1356,15 +1419,22 @@ def unpack_line_telemetry(payload: bytes) -> dict:
         "line_calibrated_valid": bool(flags & (1 << 1)),
         "line_calibrating": bool(flags & (1 << 2)),
         "line_threshold_percent": threshold_percent,
+        "line_filter_percent": filter_percent,
         "line_read_hz": read_hz,
     }
 
 
 def unpack_line_fast_telemetry(payload: bytes) -> dict:
-    if len(payload) != LINE_FAST_TELEMETRY_FRAME.size:
+    if len(payload) == LINE_FAST_TELEMETRY_FILTER_FRAME.size:
+        position, track_type, flags, threshold_percent, read_hz, filter_percent = (
+            LINE_FAST_TELEMETRY_FILTER_FRAME.unpack(payload)
+        )
+    elif len(payload) == LINE_FAST_TELEMETRY_FRAME.size:
+        position, track_type, flags, threshold_percent, read_hz = LINE_FAST_TELEMETRY_FRAME.unpack(payload)
+        filter_percent = 100
+    else:
         raise ValueError("payload linha rapida com tamanho invalido")
 
-    position, track_type, flags, threshold_percent, read_hz = LINE_FAST_TELEMETRY_FRAME.unpack(payload)
     return {
         "line_position": position,
         "line_track_type": track_type,
@@ -1372,6 +1442,7 @@ def unpack_line_fast_telemetry(payload: bytes) -> dict:
         "line_calibrated_valid": bool(flags & (1 << 1)),
         "line_calibrating": bool(flags & (1 << 2)),
         "line_threshold_percent": threshold_percent,
+        "line_filter_percent": filter_percent,
         "line_read_hz": read_hz,
     }
 
@@ -1391,7 +1462,13 @@ def unpack_rgb_led_telemetry(payload: bytes) -> dict:
 
 
 def unpack_safety_telemetry(payload: bytes) -> dict:
-    if len(payload) == SAFETY_TELEMETRY_FRAME.size:
+    distance_limit = 1.0
+    distance_traveled = 0.0
+    if len(payload) == SAFETY_TELEMETRY_DISTANCE_FRAME.size:
+        flags, roll_limit, battery_limit, current_roll, current_battery, line_timeout, line_elapsed, distance_limit, distance_traveled = (
+            SAFETY_TELEMETRY_DISTANCE_FRAME.unpack(payload)
+        )
+    elif len(payload) == SAFETY_TELEMETRY_FRAME.size:
         flags, roll_limit, battery_limit, current_roll, current_battery, line_timeout, line_elapsed = (
             SAFETY_TELEMETRY_FRAME.unpack(payload)
         )
@@ -1417,22 +1494,31 @@ def unpack_safety_telemetry(payload: bytes) -> dict:
         "safety_ble_loss_enabled": bool(flags & (1 << 8)),
         "safety_ble_loss_active": bool(flags & (1 << 9)),
         "safety_ble_connected": bool(flags & (1 << 10)),
+        "safety_distance_limit_enabled": bool(flags & (1 << 11)),
+        "safety_distance_limit_active": bool(flags & (1 << 12)),
         "safety_roll_limit_deg": roll_limit,
         "safety_battery_block_percent": battery_limit,
         "safety_line_loss_timeout_s": line_timeout,
         "safety_line_loss_elapsed_s": line_elapsed,
         "safety_current_roll_deg": current_roll,
         "safety_current_battery_percent": current_battery,
+        "safety_distance_limit_m": distance_limit,
+        "safety_distance_traveled_m": distance_traveled,
     }
 
 
 def unpack_system_telemetry(payload: bytes) -> dict:
-    if len(payload) != SYSTEM_TELEMETRY_FRAME.size:
+    if len(payload) == SYSTEM_TELEMETRY_FRAME.size:
+        cpu0_percent, cpu1_percent, flags = SYSTEM_TELEMETRY_FRAME.unpack(payload)
+    elif len(payload) == SYSTEM_TELEMETRY_LEGACY_FRAME.size:
+        cpu0_percent, cpu1_percent = SYSTEM_TELEMETRY_LEGACY_FRAME.unpack(payload)
+        flags = SYSTEM_FLAG_ZERO_BRAKE_ENABLED
+    else:
         raise ValueError("payload sistema com tamanho invalido")
-    cpu0_percent, cpu1_percent = SYSTEM_TELEMETRY_FRAME.unpack(payload)
     return {
         "cpu0_percent": cpu0_percent,
         "cpu1_percent": cpu1_percent,
+        "zero_brake_enabled": bool(flags & SYSTEM_FLAG_ZERO_BRAKE_ENABLED),
     }
 
 

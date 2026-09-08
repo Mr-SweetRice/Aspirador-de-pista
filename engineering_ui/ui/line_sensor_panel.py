@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import pyqtgraph as pg
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QPainter, QPen
 from PySide6.QtWidgets import (
     QComboBox,
@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QScrollArea,
+    QSlider,
     QSpinBox,
     QVBoxLayout,
     QWidget,
@@ -77,6 +78,7 @@ class LineSensorPanel(QWidget):
     calibrate_requested = Signal(int)
     track_type_requested = Signal(int)
     threshold_requested = Signal(int)
+    filter_requested = Signal(int)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -111,6 +113,11 @@ class LineSensorPanel(QWidget):
         self.threshold_input.setRange(0, 45)
         self.threshold_input.setValue(0)
         self.threshold_input.setSuffix(" %")
+        self.filter_slider = QSlider(Qt.Horizontal)
+        self.filter_slider.setRange(0, 100)
+        self.filter_slider.setValue(100)
+        self.filter_slider.setMinimumWidth(150)
+        self.filter_value_label = QLabel("100 %")
         self.status_label = QLabel("-")
         controls_layout.addWidget(self.calibrate_button)
         controls_layout.addWidget(QLabel("Tempo"))
@@ -119,6 +126,9 @@ class LineSensorPanel(QWidget):
         controls_layout.addWidget(self.track_type_combo)
         controls_layout.addWidget(QLabel("Limiar"))
         controls_layout.addWidget(self.threshold_input)
+        controls_layout.addWidget(QLabel("Filtro"))
+        controls_layout.addWidget(self.filter_slider)
+        controls_layout.addWidget(self.filter_value_label)
         controls_layout.addWidget(self.status_label, 1)
         root.addWidget(controls)
 
@@ -180,10 +190,15 @@ class LineSensorPanel(QWidget):
         root.addStretch(1)
 
         self._hz_history: list[float] = []
+        self._filter_send_timer = QTimer(self)
+        self._filter_send_timer.setSingleShot(True)
+        self._filter_send_timer.setInterval(120)
+        self._filter_send_timer.timeout.connect(self._emit_filter)
 
         self.calibrate_button.clicked.connect(self._emit_calibrate)
         self.track_type_combo.currentIndexChanged.connect(self._emit_track_type)
         self.threshold_input.editingFinished.connect(self._emit_threshold)
+        self.filter_slider.valueChanged.connect(self._on_filter_changed)
 
     def refresh(self, state: RobotState) -> None:
         for index in range(8):
@@ -209,6 +224,11 @@ class LineSensorPanel(QWidget):
             self.threshold_input.blockSignals(True)
             self.threshold_input.setValue(state.line_threshold_percent)
             self.threshold_input.blockSignals(False)
+        if self.filter_slider.value() != state.line_filter_percent and not self.filter_slider.isSliderDown():
+            self.filter_slider.blockSignals(True)
+            self.filter_slider.setValue(state.line_filter_percent)
+            self.filter_value_label.setText(f"{state.line_filter_percent} %")
+            self.filter_slider.blockSignals(False)
         if state.line_calibrating:
             calibration = "calibrando"
         elif state.line_calibrated_valid:
@@ -232,6 +252,13 @@ class LineSensorPanel(QWidget):
 
     def _emit_threshold(self) -> None:
         self.threshold_requested.emit(self.threshold_input.value())
+
+    def _on_filter_changed(self, value: int) -> None:
+        self.filter_value_label.setText(f"{value} %")
+        self._filter_send_timer.start()
+
+    def _emit_filter(self) -> None:
+        self.filter_requested.emit(self.filter_slider.value())
 
     @staticmethod
     def _make_bar() -> QProgressBar:
