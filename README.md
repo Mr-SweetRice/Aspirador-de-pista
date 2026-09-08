@@ -1,6 +1,6 @@
 # Aspirador de Pista
 
-Firmware ESP-IDF para o ESP32-S3-DevKitC-1, responsável pelo controle do um robô follow line ganhador da robodori.
+Firmware ESP-IDF para o ESP32-S3-DevKitC-1, responsável pelo controle do robô follow line ganhador da robodori.
 ## Estrutura
 
 - `main/`: inicializacao geral, NVS e controle de servicos/tasks.
