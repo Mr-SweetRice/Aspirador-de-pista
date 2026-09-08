@@ -144,6 +144,3 @@ Se o encoder instalado tiver outra resolução ou redução, ajuste `components/
 - Calibrar IMU, sensor de linha e odometria depois da montagem final.
 - Usar a função de parada da interface antes de desconectar a bateria ou o BLE.
 
-## Itens que precisam ser confirmados na montagem física
-
-Para transformar este documento em um esquema elétrico definitivo, ainda faltam o modelo específico do módulo do SI2300, o modelo do QTR/VL53L0X e a confirmação de como os GA12-N30 serão alimentados. Esses itens podem alterar conectores e limites de corrente, embora não mudem a pinagem de firmware documentada acima.
