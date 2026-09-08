@@ -5,23 +5,23 @@ Firmware ESP-IDF para o ESP32-S3-DevKitC-1, responsável pelo controle de um rob
 ## Estrutura
 
 - `main/`: inicializacao geral, NVS e controle de servicos/tasks.
-- `components/motors`: acionamento PWM dos motores principais, TB6612FNG e motor auxiliar.
+- `components/motors`: acionamento PWM dos motores principais, TB6612FNG e motor 8520 da turbina.
 - `components/line_sensor`: pinagem do sensor de linha QTR-8A/QTR-8D.
 - `components/encoder`: pinagem e parametros dos encoders N30.
-- `components/battery_level`: reservado para bateria.
+- `components/battery_level`: leitura e estimativa do nível da bateria pelo ADC.
 - `components/comms`: comunicacao BLE e protocolo binario.
 - `components/odometry`: configuracoes basicas de odometria.
 - `components/imu`: configuracao I2C do MPU-9250.
 - `components/memory`: configuracao base de NVS.
 - `components/portal_sensor` e `components/vl53l0x_driver`: sensor de portal/distância VL53L0X.
-- `engineering_ui/`: interface de controle, mapas, gráficos e configuração da telemetria.
+- `engineering_ui/`: **Painel de Controle do Robô**, com mapas, gráficos e configuração da telemetria.
 - `mobile_app/`: aplicativo móvel BLE.
 
 ## Documentação de hardware
 
 Materiais, esquemático funcional, pinagem, ligações do TB6612FNG e checklist de montagem: [docs/HARDWARE.md](docs/HARDWARE.md).
 
-Resumo da alimentação: bateria LiPo 3S de 300 mAh, Mini-360 ajustado para 5 V e divisor de bateria de 10 kΩ/1 kΩ. O circuito da turbina usa pull-down de 10 kΩ no controle e diodo 1N4148 em paralelo com o motor. Consulte [docs/HARDWARE.md](docs/HARDWARE.md).
+Resumo da alimentação: bateria LiPo 3S de 300 mAh, Mini-360 ajustado para 5 V e divisor de bateria de 10 kΩ/1 kΩ. A turbina usa um motor **8520 nominal de 7,4 V**, operado em 5 V, com pull-down de 10 kΩ no controle e diodo 1N4148 em paralelo com o motor. Consulte [docs/HARDWARE.md](docs/HARDWARE.md).
 
 ## Requisitos
 
@@ -100,7 +100,18 @@ O firmware atual inicia um servidor BLE NimBLE.
 
 Antes de enviar comandos, escreva o token na characteristic de autenticação. A fila BLE prioriza STOP, serializa as escritas ATT e reduz leituras concorrentes para evitar atrasos e perdas. A aba **Telemetria BLE** permite habilitar ou desabilitar cada pacote periódico.
 
-## Protocolo binario inicial
+## Painel de Controle do Robô
+
+Instale as dependências e execute a interface desktop:
+
+```powershell
+python -m pip install -r engineering_ui/requirements.txt
+python engineering_ui/main.py
+```
+
+O painel permite conectar e autenticar por BLE, controlar os motores, parar o robô, gravar e carregar mapas, acompanhar sensores e escolher os pacotes de telemetria transmitidos.
+
+## Protocolo binário
 
 Pacote base:
 
@@ -141,7 +152,7 @@ Os pinos dos motores ficam em `components/motors/include/motors_config.h`.
 
 - Esquerdo: `PWMA GPIO39`, `AIN1 GPIO40`, `AIN2 GPIO41`, encoder `GPIO35/GPIO14`.
 - Direito: `PWMB GPIO1`, `BIN1 GPIO2`, `BIN2 GPIO42`, encoder `GPIO21/GPIO5`.
-- Turbina: PWM via SI2300 em `GPIO4`, sem direção e sem encoder.
+- Turbina: motor **8520 7,4 V**, alimentado em 5 V e controlado por SI2300/PWM no `GPIO4`, sem direção e sem encoder.
 - Driver principal: `TB6612FNG`, `STBY GPIO36`.
 - PWM: LEDC low speed, timer 0, 10 bits, `25 kHz`, canais 0/1/2.
 

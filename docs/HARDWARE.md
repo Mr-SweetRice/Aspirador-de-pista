@@ -11,6 +11,7 @@ Este documento descreve os materiais e as ligações elétricas atualmente refle
 | 1 | Microcontrolador | **ESP32-S3-DevKitC-1** com USB e BLE |
 | 2 | Motorredutor | **GA12-N30, 6 V**, com encoder incremental, um para cada lado |
 | 1 | Driver de motores | **TB6612FNG**, ponte H dupla, canais A/B e entrada `STBY` |
+| 1 | Motor da turbina | **8520, 7,4 V nominal**, operado em 5 V pelo Mini-360 |
 | 1 | Driver do motor da turbina | **SI2300** ou módulo equivalente, acionado por PWM e sem controle de direção |
 | 1 | Resistor de pull-down | **10 kΩ** entre o pino de controle/gate do driver da turbina e GND |
 | 1 | Diodo de proteção | **1N4148**, em paralelo com os terminais do motor da turbina |
@@ -25,15 +26,17 @@ Este documento descreve os materiais e as ligações elétricas atualmente refle
 | — | Capacitores de desacoplamento | 100 nF junto aos CI/sensores e eletrolítico próximo ao driver e aos motores |
 | — | Fiação e conectores | Cabos de potência separados dos cabos de sinais, terminais e parafusos |
 
-O valor exato do módulo do motor da turbina deve ser confirmado conforme a montagem física. O firmware apenas define os limites elétricos e os sinais de controle; ele não substitui a validação da alimentação.
+O firmware define os sinais de controle, mas a corrente do motor 8520 e a capacidade térmica do Mini-360 e do SI2300 devem ser verificadas na montagem, principalmente na partida ou com a turbina travada.
 
 ## Esquemático funcional
 
 ```mermaid
 flowchart LR
     BAT[(Bateria)] --> FUS[Fusível / chave geral]
-    FUS --> VM[Alimentação da bateria\n3S: 9,0–12,6 V]
+    FUS --> VBAT[Alimentação da bateria\n3S: 9,0–12,6 V]
     FUS --> REG[Mini-360\nsaída ajustada em 5 V]
+    FUS --> MREG[Alimentação regulada dos GA12\n6 V, circuito a confirmar]
+    MREG --> VM[Barramento dos motores\n6 V]
     REG --> V5[5 V: turbina e periféricos]
     V5 --> VCC[Regulador da DevKit\n3,3 V lógica]
 
@@ -46,7 +49,7 @@ flowchart LR
     VM --> TB[TB6612FNG]
     TB --> ML[GA12-N30 esquerdo\n6 V + encoder]
     TB --> MR[GA12-N30 direito\n6 V + encoder]
-    V5 --> AUX[SI2300 / motor da turbina\n10 kΩ controle-GND\n1N4148 em paralelo]
+    V5 --> AUX[SI2300 + motor 8520\n7,4 V nominal, operado em 5 V\n10 kΩ controle-GND\n1N4148 em paralelo]
 
     MCU -- PWM A/B + IN1/IN2 + STBY --> TB
     MCU -- PWM --> AUX
@@ -79,7 +82,7 @@ O Mini-360 deve receber a bateria 3S e ser ajustado com multímetro para 5,0 V a
 | `STBY` | 36 | `TB6612 STBY` |
 | Encoder esquerdo A/B | 35 / 14 | Saídas A/B do GA12-N30 esquerdo |
 | Encoder direito A/B | 21 / 5 | Saídas A/B do GA12-N30 direito |
-| PWM motor da turbina | 4 | Gate/entrada do SI2300 |
+| PWM motor 8520 da turbina | 4 | Gate/entrada do SI2300 |
 
 Configuração atual: PWM em 25 kHz, resolução de 10 bits, quadratura 4x e amostragem dos encoders em 1000 Hz.
 
@@ -97,7 +100,7 @@ Configuração atual: PWM em 25 kHz, resolução de 10 bits, quadratura 4x e amo
 
 | TB6612FNG | Conectar em |
 |---|---|
-| `VM` | Barramento dos motores GA12-N30; confirmar se será bateria direta ou uma saída regulada compatível com o motor |
+| `VM` | Barramento regulado compatível com os motores GA12-N30 de 6 V; não usar diretamente a bateria 3S |
 | `VCC` | 3,3 V da lógica |
 | `GND` | GND comum |
 | `A01/A02` | Motor GA12-N30 esquerdo |
@@ -110,9 +113,9 @@ Coloque um capacitor de baixa impedância próximo de `VM/GND` do driver e, se o
 
 ### Circuito da turbina
 
-O controle da turbina usa um resistor de **10 kΩ entre o pino de controle do SI2300 e GND**. Esse resistor mantém o driver desligado durante o boot, reset ou quando o GPIO estiver em alta impedância.
+O motor da turbina é um **8520 nominal de 7,4 V**, alimentado em **5 V** pelo Mini-360. O controle usa um resistor de **10 kΩ entre o pino de controle do SI2300 e GND**. Esse resistor mantém o driver desligado durante o boot, reset ou quando o GPIO estiver em alta impedância.
 
-O diodo **1N4148** deve ser instalado diretamente entre os terminais do motor, com o **cátodo no terminal positivo do motor** e o **ânodo no terminal negativo**, considerando o sentido normal de alimentação. Ele absorve o pico de tensão gerado quando o PWM desliga a corrente da bobina do motor. Mantenha os fios do diodo curtos e próximos ao motor ou ao driver.
+O diodo **1N4148** deve ser instalado diretamente entre os terminais do motor, com o **cátodo no terminal positivo do motor** e o **ânodo no terminal negativo**, considerando o sentido normal de alimentação. Ele reduz o pico de tensão gerado quando o PWM desliga a corrente da bobina. Mantenha os fios do diodo curtos e próximos ao motor ou ao driver. Como o 1N4148 é um diodo de pequeno sinal, confirme que ele suporta os pulsos do motor 8520; se aquecer ou falhar, use um diodo rápido ou Schottky dimensionado para a corrente de partida do motor.
 
 Esse arranjo presume que a turbina gira em um único sentido. Se o circuito passar a inverter a polaridade do motor, o 1N4148 não deve ser ligado dessa forma; nesse caso será necessário um circuito de proteção bidirecional apropriado.
 
@@ -146,4 +149,4 @@ Se o encoder instalado tiver outra resolução ou redução, ajuste `components/
 
 ## Itens que precisam ser confirmados na montagem física
 
-Para transformar este documento em um esquema elétrico definitivo, ainda faltam o modelo específico do módulo do SI2300, o modelo do QTR/VL53L0X e a confirmação de como os GA12-N30 serão alimentados. Esses itens podem alterar conectores e limites de corrente, embora não mudem a pinagem de firmware documentada acima.
+Para transformar este documento em um esquema elétrico definitivo, ainda faltam o modelo específico do QTR/VL53L0X e a confirmação de como os GA12-N30 de 6 V serão alimentados. A bateria 3S não deve ser aplicada diretamente aos motores de 6 V sem uma etapa de alimentação compatível. Esses itens podem alterar conectores e limites de corrente, embora não mudem a pinagem de firmware documentada acima.
