@@ -9,7 +9,7 @@ Este documento descreve os materiais e as ligações elétricas atualmente refle
 | Qtde. | Componente | Especificação / função |
 |---:|---|---|
 | 1 | Microcontrolador | **ESP32-S3-DevKitC-1** com USB e BLE |
-| 2 | Motorredutor | **GA12-N30, 6 V**, com encoder incremental, um para cada lado |
+| 2 | Motor | **GA12-N30, 6 V 1500RPM**, com encoder incremental, um para cada lado |
 | 1 | Driver de motores | **TB6612FNG**, ponte H dupla, canais A/B e entrada `STBY` |
 | 1 | Motor da turbina | **8520, 7,4 V nominal**, operado em 5 V pelo Mini-360 |
 | 1 | Driver do motor da turbina | **SI2300** ou módulo equivalente, acionado por PWM e sem controle de direção |
@@ -148,6 +148,3 @@ Se o encoder instalado tiver outra resolução ou redução, ajuste `components/
 - Calibrar IMU, sensor de linha e odometria depois da montagem final.
 - Usar a função de parada da interface antes de desconectar a bateria ou o BLE.
 
-## Itens que precisam ser confirmados na montagem física
-
-Para transformar este documento em um esquema elétrico definitivo, ainda faltam os modelos específicos do QTR e do módulo VL53L0X. A alimentação dos GA12-N30 já está definida como bateria 3S diretamente no `VM` do TB6612FNG, com potência controlada por PWM.
