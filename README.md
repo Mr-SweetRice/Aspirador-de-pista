@@ -1,5 +1,4 @@
 # Aspirador de Pista
-![Uploading IMG_20260909_151423.jpg…]()
 
 ![Aspirador de Pista](Images/IMG_20260909_151423.jpg)
 
