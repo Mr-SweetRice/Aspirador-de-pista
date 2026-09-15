@@ -1,4 +1,5 @@
 # Aspirador de Pista
+![Uploading IMG_20260909_151423.jpg…]()
 
 Firmware ESP-IDF para o ESP32-S3-DevKitC-1, responsável pelo controle do robô follow line ganhador da robodori.
 ## Estrutura
