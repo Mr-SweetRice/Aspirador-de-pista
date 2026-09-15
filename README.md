@@ -1,5 +1,7 @@
 # Aspirador de Pista
 
+![Aspirador de Pista](Images/IMG_20260909_151423.jpg)
+
 Firmware ESP-IDF para o ESP32-S3-DevKitC-1, responsável pelo controle de um robô de pista, motores GA12-N30, turbina, sensores, odometria e telemetria BLE.
 
 ## Estrutura
@@ -98,7 +100,7 @@ O firmware atual inicia um servidor BLE NimBLE.
 - Telemetry characteristic: `5d7a0003-8f5a-4a7d-9d4f-7a6c2b8d0001`
 - Token inicial: `engineering-token`
 
-Antes de enviar comandos, escreva o token na characteristic de autenticação. A fila BLE prioriza STOP, serializa as escritas ATT e reduz leituras concorrentes para evitar atrasos e perdas. A aba **Telemetria BLE** permite habilitar ou desabilitar cada pacote periódico.
+A conexão BLE é direta, sem token. A UI desktop usa comandos RBL2 com confirmação de execução, retransmissão e reconexão automática. Mapas são retomados pelo último offset recebido. STOP tem prioridade, e comandos antigos de movimento são cancelados após uma queda. A telemetria usa 20 Hz em segundo plano, pose a 60 Hz nas abas de odometria/controle e IMU rápida a 60 Hz na aba IMU. Detalhes e limites: [comunicação BLE](docs/ble_responsiveness.md).
 
 ## Painel de Controle do Robô
 
@@ -109,7 +111,7 @@ python -m pip install -r engineering_ui/requirements.txt
 python engineering_ui/main.py
 ```
 
-O painel permite conectar e autenticar por BLE, controlar os motores, parar o robô, gravar e carregar mapas, acompanhar sensores e escolher os pacotes de telemetria transmitidos.
+O painel permite conectar por BLE, controlar os motores, parar o robô, gravar e carregar mapas, acompanhar sensores e escolher os pacotes de telemetria transmitidos.
 
 ## Protocolo binário
 
