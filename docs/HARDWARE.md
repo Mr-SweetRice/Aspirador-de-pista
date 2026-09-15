@@ -97,7 +97,7 @@ Configuração atual: PWM em 25 kHz, resolução de 10 bits, quadratura 4x e amo
 
 | TB6612FNG | Conectar em |
 |---|---|
-| `VM` | Barramento dos motores GA12-N30; confirmar se será bateria direta ou uma saída regulada compatível com o motor |
+| `VM` | + Bateria |
 | `VCC` | 3,3 V da lógica |
 | `GND` | GND comum |
 | `A01/A02` | Motor GA12-N30 esquerdo |
