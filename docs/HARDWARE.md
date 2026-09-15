@@ -9,7 +9,7 @@ Este documento descreve os materiais e as ligações elétricas atualmente refle
 | Qtde. | Componente | Especificação / função |
 |---:|---|---|
 | 1 | Microcontrolador | **ESP32-S3-DevKitC-1** com USB e BLE |
-| 2 | Motorredutor | **GA12-N30, 6 V**, com encoder incremental, um para cada lado |
+| 2 | Motor | **GA12-N30, 6 V 1500RPM**, com encoder incremental, um para cada lado |
 | 1 | Driver de motores | **TB6612FNG**, ponte H dupla, canais A/B e entrada `STBY` |
 | 1 | Driver do motor da turbina | **SI2300** ou módulo equivalente, acionado por PWM e sem controle de direção |
 | 1 | Resistor de pull-down | **10 kΩ** entre o pino de controle/gate do driver da turbina e GND |
