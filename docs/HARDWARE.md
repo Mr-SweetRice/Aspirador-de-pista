@@ -11,7 +11,7 @@ Este documento descreve os materiais e as ligações elétricas atualmente refle
 | 1 | Microcontrolador | **ESP32-S3-DevKitC-1** com USB e BLE |
 | 2 | Motor | **GA12-N30, 6 V 1500RPM**, com encoder incremental, um para cada lado |
 | 1 | Driver de motores | **TB6612FNG**, ponte H dupla, canais A/B e entrada `STBY` |
-| 1 | Driver do motor da turbina | **SI2300** ou módulo equivalente, acionado por PWM e sem controle de direção |
+| 1 | Driver do motor da turbina | **SI2300** ou mosfet equivalente, acionado por PWM e sem controle de direção |
 | 1 | Resistor de pull-down | **10 kΩ** entre o pino de controle/gate do driver da turbina e GND |
 | 1 | Diodo de proteção | **1N4148**, em paralelo com os terminais do motor da turbina |
 | 1 | Sensor de linha | **QTR-8A/QTR-8D** ou placa equivalente com 8 canais |
