@@ -25,13 +25,14 @@
 - Fila TX BLE com task dedicada `ble_tx`.
 - Backpressure via `BLE_GAP_EVENT_NOTIFY_TX`.
 - Telemetria agregada em `COMMS_TELE_BUNDLE`.
-- Periodo de telemetria BLE reduzido para 10 Hz, com conteudo alternado por bundle.
+- Telemetria rápida limitada nominalmente a 60 Hz; estados completos são enviados em frequências menores e alternados por bundle.
+- Pacotes periódicos podem ser habilitados ou desabilitados no **Painel de Controle do Robô**.
 - Fallback para pacotes pequenos quando MTU nao comporta bundle.
 - Janelas bulk para leitura de lista/chunks de mapa.
 - Status enviado como resposta do comando `STOP`.
-- Tasks BLE fixadas no nucleo 0, deixando sensores/controle no nucleo 1.
+- Telemetria BLE executada no núcleo 0; comandos BLE e controle executam no núcleo 1 com prioridades distintas.
 - Tick do FreeRTOS em 1000 Hz para suportar delays de 1-2 ms.
-- Sensor de linha limitado a 500 Hz com timeout de 1000 us para nao travar o core de controle.
+- Sensor de linha configurado com alvo de 1500 Hz e timeout curto de leitura para evitar bloqueios longos no núcleo de controle.
 - Stack da task de bateria aumentada para evitar reset por overflow durante logs/leitura ADC.
 
 ## Criterios para considerar estavel
@@ -48,6 +49,6 @@
 
 1. Aumentar a janela bulk e bloquear telemetria ate o fim explicito da leitura de mapa.
 2. Adicionar ACK de mapa com janela de um chunk em voo por vez e timeout/retry no protocolo.
-3. Coalescer comandos PWM na UI/firmware para manter somente o ultimo valor por motor.
-4. Separar perfis de telemetria configuraveis pela UI: diagnostico, controle e mapa.
-5. Criar counters expostos na UI: MTU, RSSI quando disponivel, fila TX, notify OK/fail e motivo da ultima desconexao.
+3. Expor na interface contadores de MTU, RSSI, fila TX, notificações OK/falha e motivo da última desconexão.
+4. Medir latência física de STOP e comandos de controle em diferentes celulares/computadores.
+5. Ajustar os perfis de telemetria com base nessas medições de bancada.

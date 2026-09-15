@@ -114,7 +114,7 @@ MAP_MAX_SEGMENT_M = 0.30
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("Aspirador de Pista - UI de Engenharia")
+        self.setWindowTitle("Painel de Controle do Robô")
         self.state = RobotState(mode="ble")
         self.settings = QSettings("AspiradorDePista", "EngineeringUI")
         self.state.mag_ignored = self.settings.value("imu/mag_ignored", self.state.mag_ignored, type=bool)

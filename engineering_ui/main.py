@@ -10,7 +10,7 @@ from ui.main_window import MainWindow
 
 def main() -> int:
     app = QApplication(sys.argv)
-    app.setApplicationName("Aspirador de Pista - Engenharia")
+    app.setApplicationName("Painel de Controle do Robô")
 
     window = MainWindow()
     window.resize(1320, 820)

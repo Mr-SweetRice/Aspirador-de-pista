@@ -48,7 +48,7 @@ class ControlPanel(QWidget):
         motor_layout.addWidget(self.right_value, 1, 2)
         layout.addWidget(motors)
 
-        aux = QGroupBox("Motor auxiliar")
+        aux = QGroupBox("Turbina — motor 8520")
         aux_layout = QGridLayout(aux)
         self.aux_slider = QSlider(Qt.Horizontal)
         self.aux_slider.setRange(0, 100)

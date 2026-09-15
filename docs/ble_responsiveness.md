@@ -21,6 +21,8 @@ Apenas o transporte de amostras foi ajustado:
 | Estado do controle | 15 Hz |
 | Linha completa | Até 30 Hz, conforme espaço no pacote |
 
+O **Painel de Controle do Robô** possui a página **Telemetria BLE**, que permite ativar ou desativar individualmente os pacotes periódicos. As respostas de comandos e de mapas não podem ser desabilitadas.
+
 A pose é inserida primeiro. Os estados regulares vêm antes da linha completa para evitar que ela ocupe o espaço necessário ao controle/odometria. Mesmo nas janelas curtas de transferência de mapas, há oportunidades de envio da odometria completa. Comandos comuns não suspendem mais os estados regulares por 300 ms.
 
 Essas taxas são alvos, não garantias de entrega. Dependem do MTU, intervalo negociado, disponibilidade de TX e carga. MTU preferido permanece 256; com MTU 23 a pose ainda cabe, mas vários estados completos não cabem. O intervalo solicitado passou a 7,5–15 ms, sem latência de conexão; a central pode escolher outro intervalo.
@@ -40,4 +42,4 @@ Correção do START/STOP da gravação: `MAP_RECORD_STOP` (0x23) também tem pri
 - Em `mobile_app`, `npm run validate`: tipos e testes da fila/protocolo, incluindo decodificação de odometria.
 - Build ESP-IDF 5.3: `build/aspirador_de_pista.bin`.
 
-Não houve gravação no robô nem medição de rádio nesta alteração. Para validar em bancada, comparar `track_odometry_loop_hz` e `imu_loop_hz` em repouso, ajustando PWM e transferindo mapas; verificar continuidade de pose e odometria completa. Com o robô suspenso, testar STOP durante uma sequência e confirmar ausência de PWM antigo após a parada. Medir latência física separadamente do tempo ATT e registrar MTU/intervalo efetivamente negociados.
+O firmware foi compilado e as filas/protocolo foram cobertos pelos testes automatizados. A versão mais recente ainda deve ser confirmada no hardware quando a porta serial estiver disponível. Na bancada, compare `track_odometry_loop_hz` e `imu_loop_hz` em repouso, ajustando PWM e transferindo mapas; verifique a continuidade da pose e da odometria completa. Com o robô suspenso, teste STOP durante uma sequência e confirme a ausência de PWM antigo após a parada. Meça a latência física separadamente do tempo ATT e registre o MTU e o intervalo efetivamente negociados.
